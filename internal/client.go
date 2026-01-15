@@ -434,6 +434,13 @@ type (
 		Close()
 	}
 
+	PayloadLimitOptions struct {
+		MemoUploadErrorLimit      *converter.PayloadLimit
+		MemoUploadWarningLimit    *converter.PayloadLimit
+		PayloadUploadErrorLimit   *converter.PayloadLimit
+		PayloadUploadWarningLimit *converter.PayloadLimit
+	}
+
 	// ClientOptions are optional parameters for Client creation.
 	//
 	// Exposed as: [go.temporal.io/sdk/client.Options]
@@ -533,6 +540,8 @@ type (
 		//
 		// NOTE: Experimental
 		Plugins []ClientPlugin
+
+		PayloadLimits PayloadLimitOptions
 	}
 
 	// HeadersProvider returns a map of gRPC headers that should be used on every request.

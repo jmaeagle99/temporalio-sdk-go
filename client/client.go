@@ -216,6 +216,8 @@ type (
 	// Options are optional parameters for Client creation.
 	Options = internal.ClientOptions
 
+	PayloadLimitOptions = internal.PayloadLimitOptions
+
 	// ConnectionOptions are optional parameters that can be specified in ClientOptions
 	ConnectionOptions = internal.ConnectionOptions
 
