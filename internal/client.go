@@ -533,6 +533,9 @@ type (
 		//
 		// NOTE: Experimental
 		Plugins []ClientPlugin
+
+		// Configuration for when payload sizes exceed limits.
+		PayloadLimits PayloadLimitOptions
 	}
 
 	// HeadersProvider returns a map of gRPC headers that should be used on every request.
