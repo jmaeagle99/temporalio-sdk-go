@@ -19,6 +19,7 @@ import (
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal"
 	"go.temporal.io/sdk/internal/common/metrics"
+	iext "go.temporal.io/sdk/internal/externalstorage"
 )
 
 // DeploymentReachability specifies which category of tasks may reach a worker
@@ -218,6 +219,11 @@ type (
 
 	// ConnectionOptions are optional parameters that can be specified in ClientOptions
 	ConnectionOptions = internal.ConnectionOptions
+
+	// PayloadLimitOptions are optional payload size limits that can be specified in ClientOptions.
+	PayloadLimitOptions = internal.PayloadLimitOptions
+
+	ExternalStorageOptions = iext.ExternalStorageOptions
 
 	// Credentials are optional credentials that can be specified in ClientOptions.
 	Credentials = internal.Credentials

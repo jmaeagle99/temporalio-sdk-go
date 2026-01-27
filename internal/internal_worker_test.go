@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/internal/common/metrics"
+	iconverter "go.temporal.io/sdk/internal/converter"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -29,7 +30,6 @@ import (
 	"google.golang.org/grpc"
 
 	"go.temporal.io/sdk/converter"
-	iconverter "go.temporal.io/sdk/internal/converter"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/log"
 )
@@ -1632,11 +1632,12 @@ func (s *internalWorkerTestSuite) testWorkflowTaskHandlerHelper(params workerExe
 
 func (s *internalWorkerTestSuite) TestWorkflowTaskHandlerWithDataConverter() {
 	cache := NewWorkerCache()
+	logger := getLogger()
 	params := workerExecutionParameters{
 		Namespace:     testNamespace,
 		Identity:      "identity",
-		Logger:        getLogger(),
-		DataConverter: iconverter.NewTestDataConverter(),
+		Logger:        logger,
+		DataConverter: iconverter.NewPayloadLimitDataConverter(iconverter.NewTestDataConverter(), logger),
 		cache:         cache,
 	}
 	s.testWorkflowTaskHandlerHelper(params)
@@ -2673,7 +2674,7 @@ func TestWorkerOptionDefaults(t *testing.T) {
 		TaskQueueActivitiesPerSecond:   defaultTaskQueueActivitiesPerSecond,
 		WorkerLocalActivitiesPerSecond: defaultWorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:   stickyWorkflowTaskScheduleToStartTimeoutSeconds * time.Second,
-		DataConverter:                  converter.GetDefaultDataConverter(),
+		DataConverter:                  iconverter.NewPayloadLimitDataConverter(converter.GetDefaultDataConverter(), workflowWorker.executionParameters.Logger),
 		Logger:                         workflowWorker.executionParameters.Logger,
 		MetricsHandler:                 workflowWorker.executionParameters.MetricsHandler,
 		Identity:                       workflowWorker.executionParameters.Identity,
@@ -2693,16 +2694,19 @@ func TestWorkerOptionDefaults(t *testing.T) {
 func TestWorkerOptionNonDefaults(t *testing.T) {
 	taskQueue := "worker-options-tq"
 
+	dataConverter := &converter.CompositeDataConverter{}
+
 	client := &WorkflowClient{
-		workflowService:    nil,
-		conn:               nil,
-		namespace:          "worker-options-test",
-		registry:           nil,
-		identity:           "143@worker-options-test-1",
-		dataConverter:      &converter.CompositeDataConverter{},
-		failureConverter:   GetDefaultFailureConverter(),
-		contextPropagators: nil,
-		logger:             ilog.NewNopLogger(),
+		workflowService:       nil,
+		conn:                  nil,
+		namespace:             "worker-options-test",
+		registry:              nil,
+		identity:              "143@worker-options-test-1",
+		originalDataConverter: dataConverter,
+		dataConverter:         dataConverter,
+		failureConverter:      GetDefaultFailureConverter(),
+		contextPropagators:    nil,
+		logger:                ilog.NewNopLogger(),
 	}
 
 	options := WorkerOptions{
@@ -2790,7 +2794,7 @@ func TestLocalActivityWorkerOnly(t *testing.T) {
 		TaskQueueActivitiesPerSecond:   defaultTaskQueueActivitiesPerSecond,
 		WorkerLocalActivitiesPerSecond: defaultWorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:   stickyWorkflowTaskScheduleToStartTimeoutSeconds * time.Second,
-		DataConverter:                  converter.GetDefaultDataConverter(),
+		DataConverter:                  iconverter.NewPayloadLimitDataConverter(converter.GetDefaultDataConverter(), workflowWorker.executionParameters.Logger),
 		FailureConverter:               GetDefaultFailureConverter(),
 		Logger:                         workflowWorker.executionParameters.Logger,
 		MetricsHandler:                 workflowWorker.executionParameters.MetricsHandler,

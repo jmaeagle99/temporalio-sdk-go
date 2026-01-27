@@ -3,6 +3,7 @@ package activity
 import (
 	"context"
 
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal"
 	"go.temporal.io/sdk/internal/common/metrics"
 	"go.temporal.io/sdk/log"
@@ -114,4 +115,15 @@ func IsActivity(ctx context.Context) bool {
 // type as client.Client.
 func GetClient(ctx context.Context) internal.Client {
 	return internal.GetClient(ctx)
+}
+
+func CreatePayloadHandle(ctx context.Context, value interface{}) (converter.PayloadHandle, error) {
+	dataConverter := internal.GetActivityDataConverter(ctx)
+	payload, err := dataConverter.ToPayload(value)
+	var handle converter.PayloadHandle
+	if err != nil {
+		return handle, err
+	}
+	handle.Initialize(dataConverter, payload)
+	return handle, nil
 }

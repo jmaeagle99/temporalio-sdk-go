@@ -32,6 +32,7 @@ import (
 
 	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal/common/metrics"
+	iconverter "go.temporal.io/sdk/internal/converter"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/log"
 )
@@ -2226,7 +2227,7 @@ func (env *testWorkflowEnvironmentImpl) newTestActivityTaskHandler(taskQueue str
 		Logger:             env.logger,
 		BackgroundContext:  env.workerOptions.BackgroundActivityContext,
 		FailureConverter:   env.failureConverter,
-		DataConverter:      dataConverter,
+		DataConverter:      iconverter.NewPayloadLimitDataConverter(dataConverter, env.logger),
 		WorkerStopChannel:  env.workerStopChannel,
 		ContextPropagators: env.contextPropagators,
 	}

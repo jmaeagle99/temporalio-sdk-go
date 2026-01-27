@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -39,6 +40,7 @@ import (
 	sdkopentracing "go.temporal.io/sdk/contrib/opentracing"
 	"go.temporal.io/sdk/contrib/resourcetuner"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/externalstorage"
 	"go.temporal.io/sdk/test"
 
 	historypb "go.temporal.io/api/history/v1"
@@ -53,6 +55,8 @@ import (
 	"go.temporal.io/sdk/internal/interceptortest"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/test/externalstorage/filesystem"
+	memory "go.temporal.io/sdk/test/externalstorage/memory"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 )
@@ -167,7 +171,24 @@ func (ts *IntegrationTestSuite) SetupTest() {
 		clientInterceptors = append(clientInterceptors, interceptor)
 	}
 
+	dataConverter := converter.GetDefaultDataConverter()
+
+	if false {
+		dataConverter = converter.NewCodecDataConverter(
+			dataConverter,
+			converter.NewZlibCodec(converter.ZlibCodecOptions{AlwaysEncode: true}),
+		)
+	}
+
 	var err error
+	var driver externalstorage.ExternalStorageDriver
+	if true {
+		driver, err = filesystem.NewDriver(filesystem.DriverOptions{})
+	} else {
+		driver = memory.NewDriver(memory.DriverOptions{})
+	}
+	ts.NoError(err)
+
 	trafficController := test.NewSimpleTrafficController()
 	ts.client, err = client.Dial(client.Options{
 		HostPort:  ts.config.ServiceAddr,
@@ -181,6 +202,15 @@ func (ts *IntegrationTestSuite) SetupTest() {
 		TrafficController: trafficController,
 		Interceptors:      clientInterceptors,
 		ConnectionOptions: client.ConnectionOptions{TLS: ts.config.TLS},
+		PayloadLimits: internal.PayloadLimitOptions{
+			PayloadSizeWarning: 128,
+		},
+		ExternalStorage: client.ExternalStorageOptions{
+			Provider: externalstorage.NewSingleDriverProviderWithThreshold(
+				driver,
+				128,
+			),
+		},
 	})
 	ts.NoError(err)
 
@@ -8190,6 +8220,83 @@ func (ts *IntegrationTestSuite) TestUnhandledCommandAndMetrics() {
 	ts.Equal(1, workflowCompletedCount)
 }
 
+func (ts *IntegrationTestSuite) TestPayloadHandles() {
+	line1 := "I'm a little teapot, short and stout."
+	line2 := "Here is my handle, here is my spout."
+	line3 := "When I get the steam up, hear me shout."
+	line4 := "Tip me over and pour me out."
+
+	appendLyricLine := func(ctx context.Context, lyricsHandle converter.PayloadHandle, nextLine string) (converter.PayloadHandle, error) {
+		var priorlyrics string
+		lyricsHandle.Get(&priorlyrics)
+		newLyrics := priorlyrics + "\n" + nextLine
+		return activity.CreatePayloadHandle(ctx, newLyrics)
+	}
+
+	activityLyricsLine1 := func(ctx context.Context) (converter.PayloadHandle, error) {
+		return activity.CreatePayloadHandle(ctx, line1)
+	}
+
+	activityLyricsLine2 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line2)
+	}
+
+	activityLyricsLine3 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line3)
+	}
+
+	activityLyricsLine4 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line4)
+	}
+
+	workflowLyrics := func(ctx workflow.Context) (converter.PayloadHandle, error) {
+		ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			ScheduleToCloseTimeout: 10 * time.Second,
+		})
+
+		var lyricsHandle converter.PayloadHandle
+		err := workflow.ExecuteActivity(ctx, activityLyricsLine1).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine2, lyricsHandle).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine3, lyricsHandle).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine4, lyricsHandle).Get(ctx, &lyricsHandle)
+		return lyricsHandle, err
+	}
+
+	ts.worker.RegisterWorkflow(workflowLyrics)
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine1, internal.RegisterActivityOptions{
+		Name: "AddLine1",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine2, internal.RegisterActivityOptions{
+		Name: "AddLine2",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine3, internal.RegisterActivityOptions{
+		Name: "AddLine3",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine4, internal.RegisterActivityOptions{
+		Name: "AddLine4",
+	})
+
+	var lyricsHandle converter.PayloadHandle
+	err := ts.executeWorkflow("test-teapot-song", workflowLyrics, &lyricsHandle)
+	ts.NoError(err)
+
+	var lyrics string
+	ts.NoError(lyricsHandle.Get(&lyrics))
+
+	lines := strings.Split(lyrics, "\n")
+	ts.Len(lines, 4)
+	ts.Equal(lines[0], line1)
+	ts.Equal(lines[1], line2)
+	ts.Equal(lines[2], line3)
+	ts.Equal(lines[3], line4)
+
+	log.Println("=====Start Lyrics=====")
+	for _, line := range lines {
+		log.Println(line)
+	}
+	log.Println("=====Start Lyrics=====")
+}
+
 // Plugin sets client options, can fail dial
 type clientPluginForTest struct {
 	client.PluginBase
@@ -8581,4 +8688,297 @@ func (ts *IntegrationTestSuite) TestSimplePluginDoNothing() {
 	ts.NoError(err)
 	ts.NoError(run.Get(context.Background(), &res))
 	ts.Equal("workflow-success", res)
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSizeErrorWorkflowResult() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wfname := "payload-size-error-workflow-result"
+	ts.worker.RegisterWorkflowWithOptions(
+		func(ctx workflow.Context) (string, error) { return strings.Repeat("a", 2*1024*1024+1024), nil },
+		workflow.RegisterOptions{Name: wfname},
+	)
+	run, err := ts.client.ExecuteWorkflow(
+		ctx,
+		ts.startWorkflowOptions(ts.T().Name()),
+		wfname,
+	)
+	ts.NoError(err)
+
+	var res string
+	err = run.Get(ctx, &res)
+	var expectedErr *temporal.TimeoutError
+	ts.ErrorAs(err, &expectedErr)
+
+	eventIterator := ts.client.GetWorkflowHistory(ctx, run.GetID(), run.GetRunID(), false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	var lastWorkflowTaskFailedEvent *historypb.HistoryEvent
+	for eventIterator.HasNext() {
+		event, err := eventIterator.Next()
+		ts.NoError(err)
+		if event.EventType == enumspb.EVENT_TYPE_WORKFLOW_TASK_FAILED {
+			lastWorkflowTaskFailedEvent = event
+		}
+	}
+	ts.NotNil(lastWorkflowTaskFailedEvent)
+	attributes := lastWorkflowTaskFailedEvent.GetWorkflowTaskFailedEventAttributes()
+	ts.NotNil(attributes)
+	ts.Equal(enumspb.WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE, attributes.Cause)
+	ts.NotNil(attributes.Failure)
+	ts.Equal("[TMPRL1103] Attempted to upload payloads with size that exceeded the error limit.", attributes.Failure.Message)
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSizeErrorActivityInput() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wfName := "payload-size-error-activity-result"
+	actName := "large-payload-activity"
+	ts.worker.RegisterWorkflowWithOptions(
+		func(ctx workflow.Context) (s string, err error) {
+			err = workflow.ExecuteActivity(
+				workflow.WithActivityOptions(
+					ctx,
+					workflow.ActivityOptions{ScheduleToCloseTimeout: 5 * time.Second},
+				),
+				actName,
+				strings.Repeat("a", 2*1024*1024+1024),
+			).Get(ctx, &s)
+			return
+		},
+		workflow.RegisterOptions{Name: wfName},
+	)
+	ts.worker.RegisterActivityWithOptions(
+		func(ctx context.Context, input string) (string, error) { return input, nil },
+		activity.RegisterOptions{Name: actName},
+	)
+	run, err := ts.client.ExecuteWorkflow(
+		ctx,
+		ts.startWorkflowOptions(ts.T().Name()),
+		wfName,
+	)
+	ts.NoError(err)
+
+	var res string
+	err = run.Get(ctx, &res)
+	var expectedErr *temporal.TimeoutError
+	ts.ErrorAs(err, &expectedErr)
+
+	eventIterator := ts.client.GetWorkflowHistory(ctx, run.GetID(), run.GetRunID(), false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	var lastWorkflowTaskFailedEvent *historypb.HistoryEvent
+	for eventIterator.HasNext() {
+		event, err := eventIterator.Next()
+		ts.NoError(err)
+		if event.EventType == enumspb.EVENT_TYPE_WORKFLOW_TASK_FAILED {
+			lastWorkflowTaskFailedEvent = event
+		}
+	}
+	ts.NotNil(lastWorkflowTaskFailedEvent)
+	attributes := lastWorkflowTaskFailedEvent.GetWorkflowTaskFailedEventAttributes()
+	ts.NotNil(attributes)
+	ts.Equal(enumspb.WORKFLOW_TASK_FAILED_CAUSE_PAYLOADS_TOO_LARGE, attributes.Cause)
+	ts.NotNil(attributes.Failure)
+	ts.Equal("[TMPRL1103] Attempted to upload payloads with size that exceeded the error limit.", attributes.Failure.Message)
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSizeErrorActivityResult() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	wfName := "payload-size-error-activity-result"
+	actName := "large-payload-activity"
+	ts.worker.RegisterWorkflowWithOptions(
+		func(ctx workflow.Context) (s string, err error) {
+			err = workflow.ExecuteActivity(
+				workflow.WithActivityOptions(
+					ctx,
+					workflow.ActivityOptions{ScheduleToCloseTimeout: 10 * time.Second},
+				),
+				actName,
+			).Get(ctx, &s)
+			return
+		},
+		workflow.RegisterOptions{Name: wfName},
+	)
+	ts.worker.RegisterActivityWithOptions(
+		func(context.Context) (string, error) { return strings.Repeat("a", 2*1024*1024+1024), nil },
+		activity.RegisterOptions{Name: actName},
+	)
+	run, err := ts.client.ExecuteWorkflow(
+		ctx,
+		ts.startWorkflowOptions(ts.T().Name()),
+		wfName,
+	)
+	ts.NoError(err)
+
+	var res string
+	err = run.Get(ctx, &res)
+	var workflowExecutionErr *temporal.WorkflowExecutionError
+	ts.ErrorAs(err, &workflowExecutionErr)
+	var activityErr *temporal.ActivityError
+	ts.ErrorAs(workflowExecutionErr.Unwrap(), &activityErr)
+	var applicationErr *temporal.ApplicationError
+	ts.ErrorAs(activityErr.Unwrap(), &applicationErr)
+
+	eventIterator := ts.client.GetWorkflowHistory(ctx, run.GetID(), run.GetRunID(), false, enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT)
+	var lastActivityTaskFailedEvent *historypb.HistoryEvent
+	for eventIterator.HasNext() {
+		event, err := eventIterator.Next()
+		ts.NoError(err)
+		if event.EventType == enumspb.EVENT_TYPE_ACTIVITY_TASK_FAILED {
+			lastActivityTaskFailedEvent = event
+		}
+	}
+	ts.NotNil(lastActivityTaskFailedEvent)
+	attributes := lastActivityTaskFailedEvent.GetActivityTaskFailedEventAttributes()
+	ts.NotNil(attributes)
+	ts.NotNil(attributes.Failure)
+	ts.Equal("[TMPRL1103] Attempted to upload payloads with size that exceeded the error limit.", attributes.Failure.Message)
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSizeWarningCustomSize() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	warningSize := 512
+
+	logger := ilog.NewMemoryLogger()
+	client, err := client.Dial(client.Options{
+		HostPort:          ts.config.ServiceAddr,
+		Namespace:         ts.config.Namespace,
+		Logger:            logger,
+		ConnectionOptions: client.ConnectionOptions{TLS: ts.config.TLS},
+		MetricsHandler:    ts.metricsHandler,
+		PayloadLimits: client.PayloadLimitOptions{
+			PayloadSizeWarning: warningSize,
+		},
+	})
+	ts.NoError(err)
+	defer client.Close()
+
+	ts.worker.Stop()
+	ts.workerStopped = true
+
+	testWorker := worker.New(client, ts.taskQueueName, worker.Options{})
+	wfName := "payload-size-warning-activity-result"
+	actName := "large-payload-activity"
+	testWorker.RegisterWorkflowWithOptions(
+		func(ctx workflow.Context) (s string, err error) {
+			err = workflow.ExecuteActivity(
+				workflow.WithActivityOptions(
+					ctx,
+					workflow.ActivityOptions{ScheduleToCloseTimeout: 10 * time.Second},
+				),
+				actName,
+			).Get(ctx, &s)
+			return
+		},
+		workflow.RegisterOptions{Name: wfName},
+	)
+	testWorker.RegisterActivityWithOptions(
+		func(context.Context) (string, error) { return strings.Repeat("a", 1024), nil },
+		activity.RegisterOptions{Name: actName},
+	)
+	err = testWorker.Start()
+	ts.NoError(err)
+	defer testWorker.Stop()
+
+	run, err := client.ExecuteWorkflow(
+		ctx,
+		ts.startWorkflowOptions(ts.T().Name()),
+		wfName,
+	)
+	ts.NoError(err)
+
+	var res string
+	ts.NoError(run.Get(ctx, &res))
+	ts.True(slices.ContainsFunc(logger.Lines(), func(line string) bool {
+		return strings.HasPrefix(line, "WARN  [TMPRL1103] Attempted to upload payloads with size that exceeded the warning limit.")
+	}))
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSizeWarningDefaultSize() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := ilog.NewMemoryLogger()
+	client, err := client.Dial(client.Options{
+		HostPort:          ts.config.ServiceAddr,
+		Namespace:         ts.config.Namespace,
+		Logger:            logger,
+		ConnectionOptions: client.ConnectionOptions{TLS: ts.config.TLS},
+		MetricsHandler:    ts.metricsHandler,
+	})
+	ts.NoError(err)
+	defer client.Close()
+
+	ts.worker.Stop()
+	ts.workerStopped = true
+
+	testWorker := worker.New(client, ts.taskQueueName, worker.Options{})
+	wfname := "payload-size-warning-workflow-result"
+	testWorker.RegisterWorkflowWithOptions(
+		func(ctx workflow.Context) (string, error) { return strings.Repeat("a", 1024*1024), nil },
+		workflow.RegisterOptions{Name: wfname},
+	)
+	err = testWorker.Start()
+	ts.NoError(err)
+	defer testWorker.Stop()
+
+	run, err := client.ExecuteWorkflow(
+		ctx,
+		ts.startWorkflowOptions(ts.T().Name()),
+		wfname,
+	)
+	ts.NoError(err)
+
+	var res string
+	ts.NoError(run.Get(ctx, &res))
+	ts.True(slices.ContainsFunc(logger.Lines(), func(line string) bool {
+		return strings.HasPrefix(line, "WARN  [TMPRL1103] Attempted to upload payloads with size that exceeded the warning limit.")
+	}))
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSizeWarningClient() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := ilog.NewMemoryLogger()
+	client, err := client.Dial(client.Options{
+		HostPort:          ts.config.ServiceAddr,
+		Namespace:         ts.config.Namespace,
+		Logger:            logger,
+		ConnectionOptions: client.ConnectionOptions{TLS: ts.config.TLS},
+		MetricsHandler:    ts.metricsHandler,
+	})
+	ts.NoError(err)
+	defer client.Close()
+
+	ts.worker.Stop()
+	ts.workerStopped = true
+
+	testWorker := worker.New(client, ts.taskQueueName, worker.Options{})
+	wfname := "payload-size-warning-workflow-result"
+	testWorker.RegisterWorkflowWithOptions(
+		func(ctx workflow.Context, input string) (int, error) { return len(input), nil },
+		workflow.RegisterOptions{Name: wfname},
+	)
+	err = testWorker.Start()
+	ts.NoError(err)
+	defer testWorker.Stop()
+
+	input := strings.Repeat("i", 1024*1024)
+	run, err := client.ExecuteWorkflow(
+		ctx,
+		ts.startWorkflowOptions(ts.T().Name()),
+		wfname,
+		input,
+	)
+	ts.NoError(err)
+
+	var res int
+	ts.NoError(run.Get(ctx, &res))
+	ts.True(slices.ContainsFunc(logger.Lines(), func(line string) bool {
+		return strings.HasPrefix(line, "WARN  [TMPRL1103] Attempted to upload payloads with size that exceeded the warning limit.")
+	}))
 }
