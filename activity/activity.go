@@ -2,10 +2,13 @@ package activity
 
 import (
 	"context"
+	"reflect"
 
+	"go.temporal.io/sdk/converter"
 	"go.temporal.io/sdk/internal"
 	"go.temporal.io/sdk/internal/common/metrics"
 	"go.temporal.io/sdk/log"
+	"google.golang.org/protobuf/proto"
 )
 
 type (
@@ -114,4 +117,34 @@ func IsActivity(ctx context.Context) bool {
 // type as client.Client.
 func GetClient(ctx context.Context) internal.Client {
 	return internal.GetClient(ctx)
+}
+
+func CreatePayloadHandle(ctx context.Context, value interface{}) (converter.PayloadHandle, error) {
+	return CreatePayloadHandleWithMetadata(ctx, value, nil)
+}
+
+func isInterfaceNil(i interface{}) bool {
+	v := reflect.ValueOf(i)
+	return i == nil || (v.Kind() == reflect.Ptr && v.IsNil())
+}
+
+func CreatePayloadHandleWithMetadata(ctx context.Context, value interface{}, metadata interface{}) (converter.PayloadHandle, error) {
+	dataConverter := internal.GetActivityDataConverter(ctx)
+	var handle converter.PayloadHandle
+	payload, err := dataConverter.ToPayload(value)
+	if err != nil {
+		return handle, err
+	}
+	if !isInterfaceNil(metadata) {
+		metadataPayload, err := dataConverter.ToPayload(metadata)
+		if err != nil {
+			return handle, err
+		}
+		metadataBytes, err := proto.Marshal(metadataPayload)
+		if err != nil {
+			return handle, err
+		}
+		payload.Metadata["userMetadata"] = metadataBytes
+	}
+	return handle, dataConverter.FromPayload(payload, &handle)
 }

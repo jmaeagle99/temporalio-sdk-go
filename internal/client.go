@@ -15,6 +15,7 @@ import (
 	"google.golang.org/grpc/metadata"
 
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/extstore"
 	"go.temporal.io/sdk/internal/common/metrics"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/log"
@@ -586,6 +587,11 @@ type (
 		//
 		// NOTE: Experimental
 		Plugins []ClientPlugin
+
+		// Configuration for when payload sizes exceed limits.
+		PayloadLimits PayloadLimitOptions
+
+		ExternalStorage extstore.ExternalStorageOptions
 	}
 
 	// HeadersProvider returns a map of gRPC headers that should be used on every request.
@@ -1197,6 +1203,18 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		}
 	}
 
+	externalStorageConverter, _ := NewExternalStorageDataConverter(
+		options.DataConverter,
+		options.ExternalStorage,
+	)
+
+	payloadHandleConverter := NewPayloadHandleDataConverter(externalStorageConverter)
+
+	dataConverter, _ := NewPayloadLimitDataConverterWithOptions(
+		payloadHandleConverter,
+		options.Logger,
+		options.PayloadLimits)
+
 	client := &WorkflowClient{
 		workflowService:          workflowServiceClient,
 		conn:                     conn,
@@ -1205,7 +1223,8 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		metricsHandler:           options.MetricsHandler,
 		logger:                   options.Logger,
 		identity:                 options.Identity,
-		dataConverter:            options.DataConverter,
+		dataConverter:            dataConverter,
+		originalDataConverter:    payloadHandleConverter,
 		failureConverter:         options.FailureConverter,
 		contextPropagators:       options.ContextPropagators,
 		workerPlugins:            workerPlugins,
@@ -1215,6 +1234,7 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 			workersByTaskQueue: make(map[string]map[eagerWorker]struct{}),
 		},
 		getSystemInfoTimeout: options.ConnectionOptions.GetSystemInfoTimeout,
+		payloadLimits:        options.PayloadLimits,
 	}
 
 	// Create outbound interceptor by wrapping backwards through chain

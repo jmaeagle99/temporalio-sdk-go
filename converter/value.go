@@ -39,6 +39,18 @@ type (
 	RawValue struct {
 		payload *commonpb.Payload
 	}
+
+	// PayloadHandle is a representation of a payload that allows for defered acquisition of its value.
+	//
+	// This type can be used as a argument or return type in workflows and activities to pass through
+	// a reference to the payload. Encoding/decoding of the payload is defered until retrieving the
+	// associated value is explicitly invoked. PayloadHandle enabled payload and data converters are
+	// required for this type to be useable.
+	PayloadHandle struct {
+		converter DataConverter
+		payload   *commonpb.Payload
+		metadata  *commonpb.Payload
+	}
 )
 
 // NewRawValue creates a new RawValue instance.
@@ -56,4 +68,22 @@ func (v RawValue) MarshalJSON() ([]byte, error) {
 
 func (v *RawValue) UnmarshalJSON(b []byte) error {
 	return fmt.Errorf("RawValue is not JSON serializable")
+}
+
+func (h *PayloadHandle) Initialize(converter DataConverter, valuePayload *commonpb.Payload, metadataPayload *commonpb.Payload) {
+	h.converter = converter
+	h.payload = valuePayload
+	h.metadata = metadataPayload
+}
+
+func (h *PayloadHandle) Payload() (*commonpb.Payload, error) {
+	return h.payload, nil
+}
+
+func (h *PayloadHandle) Value(valuePtr interface{}) error {
+	return h.converter.FromPayload(h.payload, valuePtr)
+}
+
+func (h *PayloadHandle) Metadata(valuePtr interface{}) error {
+	return h.converter.FromPayload(h.metadata, valuePtr)
 }

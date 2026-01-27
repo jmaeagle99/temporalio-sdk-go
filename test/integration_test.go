@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -39,6 +40,7 @@ import (
 	sdkopentracing "go.temporal.io/sdk/contrib/opentracing"
 	"go.temporal.io/sdk/contrib/resourcetuner"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/extstore"
 	"go.temporal.io/sdk/test"
 
 	historypb "go.temporal.io/api/history/v1"
@@ -53,6 +55,8 @@ import (
 	"go.temporal.io/sdk/internal/interceptortest"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/test/extstore/filesystem"
+	memory "go.temporal.io/sdk/test/extstore/memory"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 )
@@ -167,7 +171,24 @@ func (ts *IntegrationTestSuite) SetupTest() {
 		clientInterceptors = append(clientInterceptors, interceptor)
 	}
 
+	dataConverter := converter.GetDefaultDataConverter()
+
+	if false {
+		dataConverter = converter.NewCodecDataConverter(
+			dataConverter,
+			converter.NewZlibCodec(converter.ZlibCodecOptions{AlwaysEncode: true}),
+		)
+	}
+
 	var err error
+	var driver extstore.ExternalStorageDriver
+	if true {
+		driver, err = filesystem.NewDriver(filesystem.DriverOptions{})
+	} else {
+		driver = memory.NewDriver(memory.DriverOptions{})
+	}
+	ts.NoError(err)
+
 	trafficController := test.NewSimpleTrafficController()
 	ts.client, err = client.Dial(client.Options{
 		HostPort:  ts.config.ServiceAddr,
@@ -181,6 +202,11 @@ func (ts *IntegrationTestSuite) SetupTest() {
 		TrafficController: trafficController,
 		Interceptors:      clientInterceptors,
 		ConnectionOptions: client.ConnectionOptions{TLS: ts.config.TLS},
+		DataConverter:     dataConverter,
+		PayloadLimits: internal.PayloadLimitOptions{
+			PayloadSizeWarning: 128,
+		},
+		ExternalStorage: extstore.NewWithThreshold(driver, 128),
 	})
 	ts.NoError(err)
 
@@ -8268,6 +8294,83 @@ func (ts *IntegrationTestSuite) TestUnhandledCommandAndMetrics() {
 		}
 	}
 	ts.Equal(1, workflowCompletedCount)
+}
+
+func (ts *IntegrationTestSuite) TestPayloadHandles() {
+	line1 := "I'm a little teapot, short and stout."
+	line2 := "Here is my handle, here is my spout."
+	line3 := "When I get the steam up, hear me shout."
+	line4 := "Tip me over and pour me out."
+
+	appendLyricLine := func(ctx context.Context, lyricsHandle converter.PayloadHandle, nextLine string) (converter.PayloadHandle, error) {
+		var priorlyrics string
+		lyricsHandle.Value(&priorlyrics)
+		newLyrics := priorlyrics + "\n" + nextLine
+		return activity.CreatePayloadHandle(ctx, newLyrics)
+	}
+
+	activityLyricsLine1 := func(ctx context.Context) (converter.PayloadHandle, error) {
+		return activity.CreatePayloadHandle(ctx, line1)
+	}
+
+	activityLyricsLine2 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line2)
+	}
+
+	activityLyricsLine3 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line3)
+	}
+
+	activityLyricsLine4 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line4)
+	}
+
+	workflowLyrics := func(ctx workflow.Context) (converter.PayloadHandle, error) {
+		ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			ScheduleToCloseTimeout: 10 * time.Second,
+		})
+
+		var lyricsHandle converter.PayloadHandle
+		err := workflow.ExecuteActivity(ctx, activityLyricsLine1).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine2, lyricsHandle).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine3, lyricsHandle).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine4, lyricsHandle).Get(ctx, &lyricsHandle)
+		return lyricsHandle, err
+	}
+
+	ts.worker.RegisterWorkflow(workflowLyrics)
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine1, internal.RegisterActivityOptions{
+		Name: "AddLine1",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine2, internal.RegisterActivityOptions{
+		Name: "AddLine2",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine3, internal.RegisterActivityOptions{
+		Name: "AddLine3",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine4, internal.RegisterActivityOptions{
+		Name: "AddLine4",
+	})
+
+	var lyricsHandle converter.PayloadHandle
+	err := ts.executeWorkflow("test-teapot-song", workflowLyrics, &lyricsHandle)
+	ts.NoError(err)
+
+	var lyrics string
+	ts.NoError(lyricsHandle.Value(&lyrics))
+
+	lines := strings.Split(lyrics, "\n")
+	ts.Len(lines, 4)
+	ts.Equal(lines[0], line1)
+	ts.Equal(lines[1], line2)
+	ts.Equal(lines[2], line3)
+	ts.Equal(lines[3], line4)
+
+	log.Println("=====Start Lyrics=====")
+	for _, line := range lines {
+		log.Println(line)
+	}
+	log.Println("=====Start Lyrics=====")
 }
 
 // Plugin sets client options, can fail dial
