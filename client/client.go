@@ -16,6 +16,7 @@ import (
 	"io"
 
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/extstore"
 	"go.temporal.io/sdk/internal"
 	"go.temporal.io/sdk/internal/common/metrics"
 )
@@ -217,6 +218,11 @@ type (
 
 	// ConnectionOptions are optional parameters that can be specified in ClientOptions
 	ConnectionOptions = internal.ConnectionOptions
+
+	// PayloadLimitOptions are optional payload size limits that can be specified in ClientOptions.
+	PayloadLimitOptions = internal.PayloadLimitOptions
+
+	ExternalStorageOptions = extstore.ExternalStorageOptions
 
 	// Credentials are optional credentials that can be specified in ClientOptions.
 	Credentials = internal.Credentials
