@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"go.temporal.io/sdk/internal/common/metrics"
+	iconverter "go.temporal.io/sdk/internal/converter"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -27,9 +28,9 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/api/workflowservicemock/v1"
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/proto"
 
 	"go.temporal.io/sdk/converter"
-	iconverter "go.temporal.io/sdk/internal/converter"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/log"
 )
@@ -1632,10 +1633,11 @@ func (s *internalWorkerTestSuite) testWorkflowTaskHandlerHelper(params workerExe
 
 func (s *internalWorkerTestSuite) TestWorkflowTaskHandlerWithDataConverter() {
 	cache := NewWorkerCache()
+	logger := getLogger()
 	params := workerExecutionParameters{
 		Namespace:     testNamespace,
 		Identity:      "identity",
-		Logger:        getLogger(),
+		Logger:        logger,
 		DataConverter: iconverter.NewTestDataConverter(),
 		cache:         cache,
 	}
@@ -2044,7 +2046,7 @@ func (s *internalWorkerTestSuite) TestRecordActivityHeartbeatWithDataConverter()
 	s.service.EXPECT().RecordActivityTaskHeartbeat(gomock.Any(), gomock.Any(), gomock.Any()).Return(&heartbeatResponse, nil).
 		Do(func(ctx context.Context, request *workflowservice.RecordActivityTaskHeartbeatRequest, opts ...grpc.CallOption) {
 			heartbeatRequest = request
-			require.Equal(t, encodedDetail, request.Details)
+			require.True(t, proto.Equal(encodedDetail, request.Details), "payloads should be equal")
 		}).Times(1)
 
 	_ = wfClient.RecordActivityHeartbeat(context.Background(), nil, detail1, detail2, detail3)
@@ -2673,7 +2675,6 @@ func TestWorkerOptionDefaults(t *testing.T) {
 		TaskQueueActivitiesPerSecond:   defaultTaskQueueActivitiesPerSecond,
 		WorkerLocalActivitiesPerSecond: defaultWorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:   stickyWorkflowTaskScheduleToStartTimeoutSeconds * time.Second,
-		DataConverter:                  converter.GetDefaultDataConverter(),
 		Logger:                         workflowWorker.executionParameters.Logger,
 		MetricsHandler:                 workflowWorker.executionParameters.MetricsHandler,
 		Identity:                       workflowWorker.executionParameters.Identity,
@@ -2693,16 +2694,19 @@ func TestWorkerOptionDefaults(t *testing.T) {
 func TestWorkerOptionNonDefaults(t *testing.T) {
 	taskQueue := "worker-options-tq"
 
+	dataConverter := &converter.CompositeDataConverter{}
+
 	client := &WorkflowClient{
-		workflowService:    nil,
-		conn:               nil,
-		namespace:          "worker-options-test",
-		registry:           nil,
-		identity:           "143@worker-options-test-1",
-		dataConverter:      &converter.CompositeDataConverter{},
-		failureConverter:   GetDefaultFailureConverter(),
-		contextPropagators: nil,
-		logger:             ilog.NewNopLogger(),
+		workflowService:       nil,
+		conn:                  nil,
+		namespace:             "worker-options-test",
+		registry:              nil,
+		identity:              "143@worker-options-test-1",
+		originalDataConverter: dataConverter,
+		dataConverter:         dataConverter,
+		failureConverter:      GetDefaultFailureConverter(),
+		contextPropagators:    nil,
+		logger:                ilog.NewNopLogger(),
 	}
 
 	options := WorkerOptions{
@@ -2742,7 +2746,6 @@ func TestWorkerOptionNonDefaults(t *testing.T) {
 		TaskQueueActivitiesPerSecond:   options.TaskQueueActivitiesPerSecond,
 		WorkerLocalActivitiesPerSecond: options.WorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:   options.StickyScheduleToStartTimeout,
-		DataConverter:                  client.dataConverter,
 		FailureConverter:               client.failureConverter,
 		Logger:                         client.logger,
 		MetricsHandler:                 client.metricsHandler,
@@ -2790,7 +2793,6 @@ func TestLocalActivityWorkerOnly(t *testing.T) {
 		TaskQueueActivitiesPerSecond:   defaultTaskQueueActivitiesPerSecond,
 		WorkerLocalActivitiesPerSecond: defaultWorkerLocalActivitiesPerSecond,
 		StickyScheduleToStartTimeout:   stickyWorkflowTaskScheduleToStartTimeoutSeconds * time.Second,
-		DataConverter:                  converter.GetDefaultDataConverter(),
 		FailureConverter:               GetDefaultFailureConverter(),
 		Logger:                         workflowWorker.executionParameters.Logger,
 		MetricsHandler:                 workflowWorker.executionParameters.MetricsHandler,
@@ -2809,7 +2811,6 @@ func TestLocalActivityWorkerOnly(t *testing.T) {
 func assertWorkerExecutionParamsEqual(t *testing.T, paramsA workerExecutionParameters, paramsB workerExecutionParameters) {
 	require.Equal(t, paramsA.TaskQueue, paramsA.TaskQueue)
 	require.Equal(t, paramsA.Identity, paramsB.Identity)
-	require.Equal(t, paramsA.DataConverter, paramsB.DataConverter)
 	require.Equal(t, paramsA.Tuner, paramsB.Tuner)
 	require.Equal(t, paramsA.WorkerActivitiesPerSecond, paramsB.WorkerActivitiesPerSecond)
 	require.Equal(t, paramsA.TaskQueueActivitiesPerSecond, paramsB.TaskQueueActivitiesPerSecond)

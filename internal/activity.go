@@ -291,6 +291,11 @@ func GetClient(ctx context.Context) Client {
 	return getActivityOutboundInterceptor(ctx).GetClient(ctx)
 }
 
+// GetActivityDataConverter returns the data converter for the currently executing activity.
+func GetActivityDataConverter(ctx context.Context) converter.DataConverter {
+	return getActivityEnvironmentInterceptor(ctx).env.dataConverter
+}
+
 // ServiceInvoker abstracts calls to the Temporal service from an activity implementation.
 // Implement to unit test activities.
 type ServiceInvoker interface {

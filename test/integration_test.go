@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"math"
 	"math/rand"
 	"os"
@@ -39,6 +40,7 @@ import (
 	sdkopentracing "go.temporal.io/sdk/contrib/opentracing"
 	"go.temporal.io/sdk/contrib/resourcetuner"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/extstore"
 	"go.temporal.io/sdk/test"
 
 	historypb "go.temporal.io/api/history/v1"
@@ -53,6 +55,8 @@ import (
 	"go.temporal.io/sdk/internal/interceptortest"
 	ilog "go.temporal.io/sdk/internal/log"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/test/extstore/filesystem"
+	memory "go.temporal.io/sdk/test/extstore/memory"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 )
@@ -167,7 +171,24 @@ func (ts *IntegrationTestSuite) SetupTest() {
 		clientInterceptors = append(clientInterceptors, interceptor)
 	}
 
+	dataConverter := converter.GetDefaultDataConverter()
+
+	if false {
+		dataConverter = converter.NewCodecDataConverter(
+			dataConverter,
+			converter.NewZlibCodec(converter.ZlibCodecOptions{AlwaysEncode: true}),
+		)
+	}
+
 	var err error
+	var driver extstore.ExternalStorageDriver
+	if false {
+		driver, err = filesystem.NewDriver(filesystem.DriverOptions{})
+	} else {
+		driver = memory.NewDriver(memory.DriverOptions{})
+	}
+	ts.NoError(err)
+
 	trafficController := test.NewSimpleTrafficController()
 	ts.client, err = client.Dial(client.Options{
 		HostPort:  ts.config.ServiceAddr,
@@ -181,6 +202,14 @@ func (ts *IntegrationTestSuite) SetupTest() {
 		TrafficController: trafficController,
 		Interceptors:      clientInterceptors,
 		ConnectionOptions: client.ConnectionOptions{TLS: ts.config.TLS},
+		DataConverter:     dataConverter,
+		PayloadLimits: internal.PayloadLimitOptions{
+			PayloadSizeWarning: 128,
+		},
+		ExternalStorage: &extstore.ExternalStorageOptions{
+			Drivers:              []extstore.ExternalStorageDriver{driver},
+			PayloadSizeThreshold: -1,
+		},
 	})
 	ts.NoError(err)
 
@@ -1605,6 +1634,16 @@ func (ts *IntegrationTestSuite) TestChildWorkflowTypedSearchAttributes() {
 func (ts *IntegrationTestSuite) TestLargeQueryResultError() {
 	ctx, cancel := context.WithTimeout(context.Background(), ctxTimeout)
 	defer cancel()
+
+	ts.worker.Stop()
+	ts.workerStopped = true
+	ts.worker = worker.New(ts.client, ts.taskQueueName, internal.WorkerOptions{
+		DisablePayloadErrorLimit: true,
+	})
+	ts.registerWorkflowsAndActivities(ts.worker)
+	ts.NoError(ts.worker.Start())
+	ts.workerStopped = false
+
 	run, err := ts.client.ExecuteWorkflow(ctx,
 		ts.startWorkflowOptions("test-large-query-error"), ts.workflows.LargeQueryResultWorkflow)
 	ts.Nil(err)
@@ -8270,6 +8309,156 @@ func (ts *IntegrationTestSuite) TestUnhandledCommandAndMetrics() {
 	ts.Equal(1, workflowCompletedCount)
 }
 
+func (ts *IntegrationTestSuite) TestPayloadHandles() {
+	line1 := "I'm a little teapot, short and stout."
+	line2 := "Here is my handle, here is my spout."
+	line3 := "When I get the steam up, hear me shout."
+	line4 := "Tip me over and pour me out."
+
+	appendLyricLine := func(ctx context.Context, lyricsHandle converter.PayloadHandle, nextLine string) (converter.PayloadHandle, error) {
+		var priorlyrics string
+		activity.GetPayloadHandleValue(lyricsHandle, &priorlyrics)
+		newLyrics := priorlyrics + "\n" + nextLine
+		return activity.CreatePayloadHandle(ctx, newLyrics)
+	}
+
+	activityLyricsLine1 := func(ctx context.Context) (converter.PayloadHandle, error) {
+		return activity.CreatePayloadHandle(ctx, line1)
+	}
+
+	activityLyricsLine2 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line2)
+	}
+
+	activityLyricsLine3 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line3)
+	}
+
+	activityLyricsLine4 := func(ctx context.Context, lyricsHandle converter.PayloadHandle) (converter.PayloadHandle, error) {
+		return appendLyricLine(ctx, lyricsHandle, line4)
+	}
+
+	workflowLyrics := func(ctx workflow.Context) (converter.PayloadHandle, error) {
+		ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			ScheduleToCloseTimeout: 10 * time.Second,
+		})
+
+		var lyricsHandle converter.PayloadHandle
+		err := workflow.ExecuteActivity(ctx, activityLyricsLine1).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine2, lyricsHandle).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine3, lyricsHandle).Get(ctx, &lyricsHandle)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine4, lyricsHandle).Get(ctx, &lyricsHandle)
+		return lyricsHandle, err
+	}
+
+	ts.worker.RegisterWorkflow(workflowLyrics)
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine1, internal.RegisterActivityOptions{
+		Name: "AddLine1",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine2, internal.RegisterActivityOptions{
+		Name: "AddLine2",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine3, internal.RegisterActivityOptions{
+		Name: "AddLine3",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine4, internal.RegisterActivityOptions{
+		Name: "AddLine4",
+	})
+
+	var lyricsHandle converter.PayloadHandle
+	err := ts.executeWorkflow("test-teapot-song-handles", workflowLyrics, &lyricsHandle)
+	ts.NoError(err)
+
+	var lyrics string
+	ts.NoError(lyricsHandle.Value(&lyrics))
+
+	lines := strings.Split(lyrics, "\n")
+	ts.Len(lines, 4)
+	ts.Equal(lines[0], line1)
+	ts.Equal(lines[1], line2)
+	ts.Equal(lines[2], line3)
+	ts.Equal(lines[3], line4)
+
+	log.Println("=====Start Lyrics=====")
+	for _, line := range lines {
+		log.Println(line)
+	}
+	log.Println("=====Start Lyrics=====")
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSimple() {
+	line1 := "I'm a little teapot, short and stout."
+	line2 := "Here is my handle, here is my spout."
+	line3 := "When I get the steam up, hear me shout."
+	line4 := "Tip me over and pour me out."
+
+	appendLyricLine := func(priorLyrics string, nextLine string) (string, error) {
+		return priorLyrics + "\n" + nextLine, nil
+	}
+
+	activityLyricsLine1 := func(ctx context.Context, priorLyrics string) (string, error) {
+		return appendLyricLine(priorLyrics, line1)
+	}
+
+	activityLyricsLine2 := func(ctx context.Context, priorLyrics string) (string, error) {
+		return appendLyricLine(priorLyrics, line2)
+	}
+
+	activityLyricsLine3 := func(ctx context.Context, priorLyrics string) (string, error) {
+		return appendLyricLine(priorLyrics, line3)
+	}
+
+	activityLyricsLine4 := func(ctx context.Context, priorLyrics string) (string, error) {
+		return appendLyricLine(priorLyrics, line4)
+	}
+
+	workflowLyrics := func(ctx workflow.Context) (string, error) {
+		ctx = workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
+			ScheduleToCloseTimeout: 1000 * time.Second,
+		})
+
+		var lyrics string
+		err := workflow.ExecuteActivity(ctx, activityLyricsLine1, "Song Lyrics:").Get(ctx, &lyrics)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine2, lyrics).Get(ctx, &lyrics)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine3, lyrics).Get(ctx, &lyrics)
+		err = workflow.ExecuteActivity(ctx, activityLyricsLine4, lyrics).Get(ctx, &lyrics)
+		return lyrics, err
+	}
+
+	ts.worker.RegisterWorkflow(workflowLyrics)
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine1, internal.RegisterActivityOptions{
+		Name: "AddLine1",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine2, internal.RegisterActivityOptions{
+		Name: "AddLine2",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine3, internal.RegisterActivityOptions{
+		Name: "AddLine3",
+	})
+	ts.worker.RegisterActivityWithOptions(activityLyricsLine4, internal.RegisterActivityOptions{
+		Name: "AddLine4",
+	})
+
+	opts := ts.startWorkflowOptions("test-teapot-song-normal")
+
+	var lyrics string
+	err := ts.executeWorkflowWithOption(opts, workflowLyrics, &lyrics)
+	ts.NoError(err)
+
+	lines := strings.Split(lyrics, "\n")
+	ts.Len(lines, 4)
+	ts.Equal(lines[0], line1)
+	ts.Equal(lines[1], line2)
+	ts.Equal(lines[2], line3)
+	ts.Equal(lines[3], line4)
+
+	log.Println("=====Start Lyrics=====")
+	for _, line := range lines {
+		log.Println(line)
+	}
+	log.Println("=====Start Lyrics=====")
+}
+
 // Plugin sets client options, can fail dial
 type clientPluginForTest struct {
 	client.PluginBase
@@ -8914,4 +9103,46 @@ func (ts *IntegrationTestSuite) TestExecuteActivitySuite() {
 		ts.True(errors.Is(err, context.DeadlineExceeded) || errors.As(err, &serviceErr))
 		activityResultChan <- "" // allow activity to complete
 	})
+}
+
+func (ts *IntegrationTestSuite) TestPayloadSizeWarningDefaultSize() {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	logger := ilog.NewMemoryLogger()
+	client, err := client.Dial(client.Options{
+		HostPort:          ts.config.ServiceAddr,
+		Namespace:         ts.config.Namespace,
+		Logger:            logger,
+		ConnectionOptions: client.ConnectionOptions{TLS: ts.config.TLS},
+		MetricsHandler:    ts.metricsHandler,
+	})
+	ts.NoError(err)
+	defer client.Close()
+
+	ts.worker.Stop()
+	ts.workerStopped = true
+
+	testWorker := worker.New(client, ts.taskQueueName, worker.Options{})
+	wfname := "payload-size-warning-workflow-result"
+	testWorker.RegisterWorkflowWithOptions(
+		func(ctx workflow.Context) (string, error) { return strings.Repeat("a", 1024*1024), nil },
+		workflow.RegisterOptions{Name: wfname},
+	)
+	err = testWorker.Start()
+	ts.NoError(err)
+	defer testWorker.Stop()
+
+	run, err := client.ExecuteWorkflow(
+		ctx,
+		ts.startWorkflowOptions(ts.T().Name()),
+		wfname,
+	)
+	ts.NoError(err)
+
+	var res string
+	ts.NoError(run.Get(ctx, &res))
+	ts.True(slices.ContainsFunc(logger.Lines(), func(line string) bool {
+		return strings.HasPrefix(line, "WARN  [TMPRL1103] Attempted to upload payloads with size that exceeded the warning limit.")
+	}))
 }
