@@ -320,6 +320,136 @@ func TestRawValueJsonConverter(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestComposableDataConverter_CodecDataConverter(t *testing.T) {
+	require := require.New(t)
+	defaultConv := GetDefaultDataConverter()
+	codec := NewZlibCodec(ZlibCodecOptions{AlwaysEncode: true})
+	dc := NewCodecDataConverter(defaultConv, codec)
+
+	composable, ok := dc.(ComposableDataConverter)
+	require.True(ok, "CodecDataConverter should implement ComposableDataConverter")
+	require.Equal(defaultConv, composable.InnerDataConverter())
+
+	// WithInnerDataConverter returns a new instance wrapping the new inner
+	altInner := NewCompositeDataConverter(NewNilPayloadConverter(), NewJSONPayloadConverter())
+	newDC := composable.WithInnerDataConverter(altInner)
+	newComposable, ok := newDC.(ComposableDataConverter)
+	require.True(ok)
+	require.Equal(altInner, newComposable.InnerDataConverter())
+	// Codecs are preserved
+	require.Equal(dc.(*CodecDataConverter).codecs, newDC.(*CodecDataConverter).codecs)
+}
+
+func TestComposableDataConverter_RemoteDataConverter(t *testing.T) {
+	require := require.New(t)
+	defaultConv := GetDefaultDataConverter()
+
+	handler := NewPayloadCodecHTTPHandler(NewZlibCodec(ZlibCodecOptions{AlwaysEncode: true}))
+	server := httptest.NewServer(handler)
+	defer server.Close()
+
+	dc := NewRemoteDataConverter(defaultConv, RemoteDataConverterOptions{Endpoint: server.URL})
+
+	composable, ok := dc.(ComposableDataConverter)
+	require.True(ok, "remoteDataConverter should implement ComposableDataConverter")
+	require.Equal(defaultConv, composable.InnerDataConverter())
+
+	altInner := NewCompositeDataConverter(NewNilPayloadConverter(), NewJSONPayloadConverter())
+	newDC := composable.WithInnerDataConverter(altInner)
+	newComposable, ok := newDC.(ComposableDataConverter)
+	require.True(ok)
+	require.Equal(altInner, newComposable.InnerDataConverter())
+}
+
+func TestGetInnerDataConverter(t *testing.T) {
+	require := require.New(t)
+	defaultConv := GetDefaultDataConverter()
+	codec := NewZlibCodec(ZlibCodecOptions{AlwaysEncode: true})
+
+	// Single layer: inner is the default (CompositeDataConverter)
+	dc := NewCodecDataConverter(defaultConv, codec)
+	require.Equal(defaultConv, GetInnerDataConverter(dc))
+
+	// Double layer: inner is still the leaf
+	dc2 := NewCodecDataConverter(dc, codec)
+	require.Equal(defaultConv, GetInnerDataConverter(dc2))
+
+	// Non-composable: returns itself
+	require.Equal(defaultConv, GetInnerDataConverter(defaultConv))
+}
+
+func TestBuildOuterChain(t *testing.T) {
+	require := require.New(t)
+	defaultConv := GetDefaultDataConverter()
+	codec := NewZlibCodec(ZlibCodecOptions{AlwaysEncode: true})
+
+	// Non-composable DC returns nil
+	require.Nil(BuildOuterChain(defaultConv))
+
+	// Single-layer codec DC
+	dc := NewCodecDataConverter(defaultConv, codec)
+	outer := BuildOuterChain(dc)
+	require.NotNil(outer)
+
+	// The outer chain is still a CodecDataConverter
+	outerComposable, ok := outer.(ComposableDataConverter)
+	require.True(ok)
+	// Its inner is the passthrough
+	_, isPassthrough := outerComposable.InnerDataConverter().(*payloadPassthroughDataConverter)
+	require.True(isPassthrough, "outer chain leaf should be payloadPassthroughDataConverter")
+
+	// Double-layer: both layers preserved, leaf is passthrough
+	dc2 := NewCodecDataConverter(dc, codec)
+	outer2 := BuildOuterChain(dc2)
+	require.NotNil(outer2)
+	outerComposable2, ok := outer2.(ComposableDataConverter)
+	require.True(ok)
+	// Middle layer should still be a CodecDataConverter
+	middle, ok := outerComposable2.InnerDataConverter().(ComposableDataConverter)
+	require.True(ok, "middle of double-layer outer chain should be ComposableDataConverter")
+	_, isPassthrough = middle.InnerDataConverter().(*payloadPassthroughDataConverter)
+	require.True(isPassthrough, "double-layer outer chain leaf should be payloadPassthroughDataConverter")
+}
+
+func TestBuildOuterChain_RoundTrip(t *testing.T) {
+	require := require.New(t)
+	defaultConv := GetDefaultDataConverter()
+	codec := NewZlibCodec(ZlibCodecOptions{AlwaysEncode: true})
+	dc := NewCodecDataConverter(defaultConv, codec)
+
+	outerChain := BuildOuterChain(dc)
+	require.NotNil(outerChain)
+	innerDC := GetInnerDataConverter(dc)
+
+	testValue := "hello outer chain"
+
+	// Encode using innerDC (type conversion only, no codec)
+	rawPayload, err := innerDC.ToPayload(testValue)
+	require.NoError(err)
+
+	// Encode through outerChain (passthrough + codec): raw -> encoded
+	encodedPayload, err := outerChain.ToPayload(rawPayload)
+	require.NoError(err)
+	require.NotEqual(rawPayload, encodedPayload, "encoded should differ from raw")
+
+	// Verify this is the same as what the full chain produces
+	fullEncoded, err := dc.ToPayload(testValue)
+	require.NoError(err)
+	require.True(proto.Equal(fullEncoded, encodedPayload), "outer chain encode should match full chain encode")
+
+	// Decode through outerChain: encoded -> raw
+	var decodedRaw *commonpb.Payload
+	err = outerChain.FromPayload(encodedPayload, &decodedRaw)
+	require.NoError(err)
+	require.True(proto.Equal(rawPayload, decodedRaw), "decoded raw should match original raw payload")
+
+	// Decode using innerDC: raw -> Go value
+	var result string
+	err = innerDC.FromPayload(decodedRaw, &result)
+	require.NoError(err)
+	require.Equal(testValue, result)
+}
+
 // errorCodecOnEncode is a codec that always returns an error on encode.
 type errorCodecOnEncode struct {
 	err error

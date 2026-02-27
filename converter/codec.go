@@ -108,6 +108,124 @@ func (*zlibCodec) Decode(payloads []*commonpb.Payload) ([]*commonpb.Payload, err
 	return result, nil
 }
 
+// ComposableDataConverter is an optional interface that DataConverter
+// implementations may implement to allow inspection and reconstruction of a
+// DataConverter chain.
+//
+// When implemented, the SDK can walk the chain to find the innermost converter
+// (typically a CompositeDataConverter) and construct an "outer chain" that
+// applies codec operations outside the workflow goroutine. This enables
+// PayloadCodecs that make network calls (e.g., external payload storage) to
+// run safely without introducing non-determinism into workflow replay.
+//
+// CodecDataConverter and remoteDataConverter implement this interface.
+type ComposableDataConverter interface {
+	// InnerDataConverter returns the wrapped/parent DataConverter.
+	// Returns nil if this is a leaf converter.
+	InnerDataConverter() DataConverter
+
+	// WithInnerDataConverter returns a new instance of this DataConverter
+	// that wraps newInner instead of its current inner converter.
+	WithInnerDataConverter(newInner DataConverter) DataConverter
+}
+
+// GetInnerDataConverter walks a DataConverter chain and returns the innermost
+// (leaf) DataConverter — the first converter in the chain that does not
+// implement ComposableDataConverter. Typically this is a CompositeDataConverter.
+//
+// If dc does not implement ComposableDataConverter, dc itself is returned.
+func GetInnerDataConverter(dc DataConverter) DataConverter {
+	current := dc
+	for {
+		composable, ok := current.(ComposableDataConverter)
+		if !ok {
+			return current
+		}
+		inner := composable.InnerDataConverter()
+		if inner == nil {
+			return current
+		}
+		current = inner
+	}
+}
+
+// BuildOuterChain reconstructs a DataConverter chain with the leaf replaced by
+// a payloadPassthroughDataConverter. The returned chain applies only the codec
+// operations (Encode/Decode) of the original chain, bypassing type conversion.
+//
+// This is used by the workflow task handler to run codec operations (including
+// network calls for external storage) outside the deterministic workflow
+// goroutine:
+//   - outerChain.FromPayload(encoded, &raw) decodes an encoded payload to a raw
+//     *commonpb.Payload without any Go-type deserialization.
+//   - outerChain.ToPayload(raw) encodes a raw *commonpb.Payload without any
+//     Go-type serialization.
+//
+// Returns nil if dc does not implement ComposableDataConverter, indicating that
+// no outer processing is needed (the DC has no codec wrapping).
+func BuildOuterChain(dc DataConverter) DataConverter {
+	composable, ok := dc.(ComposableDataConverter)
+	if !ok {
+		return nil
+	}
+	newInner := BuildOuterChain(composable.InnerDataConverter())
+	if newInner == nil {
+		newInner = &payloadPassthroughDataConverter{}
+	}
+	return composable.WithInnerDataConverter(newInner)
+}
+
+// payloadPassthroughDataConverter is used as the leaf of the outer chain
+// constructed by BuildOuterChain. It passes *commonpb.Payload values through
+// unchanged, allowing the codec layers above it to encode/decode without any
+// Go-type conversion.
+type payloadPassthroughDataConverter struct{}
+
+func (p *payloadPassthroughDataConverter) ToPayload(value interface{}) (*commonpb.Payload, error) {
+	if payload, ok := value.(*commonpb.Payload); ok {
+		return payload, nil
+	}
+	return nil, fmt.Errorf("payloadPassthroughDataConverter: expected *commonpb.Payload, got %T", value)
+}
+
+func (p *payloadPassthroughDataConverter) FromPayload(payload *commonpb.Payload, valuePtr interface{}) error {
+	if ptr, ok := valuePtr.(**commonpb.Payload); ok {
+		*ptr = payload
+		return nil
+	}
+	return fmt.Errorf("payloadPassthroughDataConverter: expected **commonpb.Payload, got %T", valuePtr)
+}
+
+func (p *payloadPassthroughDataConverter) ToPayloads(values ...interface{}) (*commonpb.Payloads, error) {
+	payloads := make([]*commonpb.Payload, len(values))
+	for i, v := range values {
+		pl, err := p.ToPayload(v)
+		if err != nil {
+			return nil, err
+		}
+		payloads[i] = pl
+	}
+	return &commonpb.Payloads{Payloads: payloads}, nil
+}
+
+func (p *payloadPassthroughDataConverter) FromPayloads(payloads *commonpb.Payloads, valuePtrs ...interface{}) error {
+	if payloads == nil {
+		return nil
+	}
+	for i, ptr := range valuePtrs {
+		if i >= len(payloads.Payloads) {
+			break
+		}
+		if err := p.FromPayload(payloads.Payloads[i], ptr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (p *payloadPassthroughDataConverter) ToString(_ *commonpb.Payload) string   { return "" }
+func (p *payloadPassthroughDataConverter) ToStrings(_ *commonpb.Payloads) []string { return nil }
+
 // CodecDataConverter is a DataConverter that wraps an underlying data
 // converter and supports chained encoding of just the payload without regard
 // for serialization to/from actual types.
@@ -123,6 +241,14 @@ type CodecDataConverter struct {
 // ToString(s), the decoders are applied first to last to reverse the effect.
 func NewCodecDataConverter(parent DataConverter, codecs ...PayloadCodec) DataConverter {
 	return &CodecDataConverter{parent, codecs}
+}
+
+// InnerDataConverter implements ComposableDataConverter.
+func (e *CodecDataConverter) InnerDataConverter() DataConverter { return e.parent }
+
+// WithInnerDataConverter implements ComposableDataConverter.
+func (e *CodecDataConverter) WithInnerDataConverter(newInner DataConverter) DataConverter {
+	return &CodecDataConverter{parent: newInner, codecs: e.codecs}
 }
 
 func (e *CodecDataConverter) encode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
@@ -418,6 +544,14 @@ func NewRemoteDataConverter(parent DataConverter, options RemoteDataConverterOpt
 	options.Endpoint = strings.TrimSuffix(options.Endpoint, "/")
 	payloadCodec := NewRemotePayloadCodec(RemotePayloadCodecOptions(options))
 	return &remoteDataConverter{parent, payloadCodec}
+}
+
+// InnerDataConverter implements ComposableDataConverter.
+func (rdc *remoteDataConverter) InnerDataConverter() DataConverter { return rdc.parent }
+
+// WithInnerDataConverter implements ComposableDataConverter.
+func (rdc *remoteDataConverter) WithInnerDataConverter(newInner DataConverter) DataConverter {
+	return &remoteDataConverter{parent: newInner, payloadCodec: rdc.payloadCodec}
 }
 
 // ToPayload implements DataConverter.ToPayload performing remote encoding on the
