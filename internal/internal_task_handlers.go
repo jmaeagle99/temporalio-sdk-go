@@ -139,6 +139,15 @@ type (
 		cache                     *WorkerCache
 		deadlockDetectionTimeout  time.Duration
 		capabilities              *workflowservice.GetSystemInfoResponse_Capabilities
+		// outerChain is the DataConverter chain with the leaf replaced by a
+		// payloadPassthroughDataConverter. It is used to encode/decode payloads
+		// outside the workflow goroutine. Nil if the DataConverter does not
+		// implement ComposableDataConverter.
+		outerChain converter.DataConverter
+		// innerDataConverter is the leaf of the DataConverter chain (typically a
+		// CompositeDataConverter). It is passed to the workflow goroutine so that
+		// codec operations do not run inside the deterministic execution.
+		innerDataConverter converter.DataConverter
 	}
 
 	activityProvider func(name string) activity
@@ -578,6 +587,8 @@ func newWorkflowTaskHandler(params workerExecutionParameters, ppMgr pressurePoin
 		cache:                     params.cache,
 		deadlockDetectionTimeout:  params.DeadlockDetectionTimeout,
 		capabilities:              params.capabilities,
+		outerChain:                converter.BuildOuterChain(params.DataConverter),
+		innerDataConverter:        converter.GetInnerDataConverter(params.DataConverter),
 	}
 }
 
@@ -684,7 +695,7 @@ func (w *workflowExecutionContextImpl) createEventHandler() {
 		w.wth.enableLoggingInReplay,
 		w.wth.metricsHandler,
 		w.wth.registry,
-		w.wth.dataConverter,
+		w.wth.innerDataConverter,
 		w.wth.failureConverter,
 		w.wth.contextPropagators,
 		w.wth.deadlockDetectionTimeout,
@@ -1277,6 +1288,19 @@ ProcessEvents:
 func (w *workflowExecutionContextImpl) ProcessLocalActivityResult(workflowTask *workflowTask, lar *localActivityResult) (*workflowTaskCompletion, error) {
 	if lar.err != nil && w.retryLocalActivity(lar) {
 		return nil, nil // nothing to do here as we are retrying...
+	}
+
+	// Local activities encode their results using the full DataConverter (including
+	// codecs). Pre-decode the result payloads here, outside the workflow goroutine,
+	// so the goroutine only sees plain decoded payloads when it processes the marker.
+	if lar.err == nil && lar.result != nil && w.wth.outerChain != nil {
+		decoded := make([]*commonpb.Payload, len(lar.result.Payloads))
+		for i, p := range lar.result.Payloads {
+			if err := w.wth.outerChain.FromPayload(p, &decoded[i]); err != nil {
+				return nil, err
+			}
+		}
+		lar.result = &commonpb.Payloads{Payloads: decoded}
 	}
 
 	return w.applyWorkflowPanicPolicy(workflowTask, w.getEventHandler().ProcessLocalActivityResult(lar))

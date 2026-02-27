@@ -17,6 +17,7 @@ import (
 	deploymentpb "go.temporal.io/api/deployment/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/proxy"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 
@@ -132,6 +133,11 @@ type (
 		logger           log.Logger
 		dataConverter    converter.DataConverter
 		failureConverter converter.FailureConverter
+		// outerChain is the DataConverter chain with the leaf replaced by a
+		// payloadPassthroughDataConverter. Used to encode/decode payloads
+		// outside the workflow goroutine. Nil if the DataConverter does not
+		// implement ComposableDataConverter.
+		outerChain converter.DataConverter
 
 		stickyUUID                   string
 		StickyScheduleToStartTimeout time.Duration
@@ -338,6 +344,7 @@ func newWorkflowTaskProcessor(
 		logger:                       params.Logger,
 		dataConverter:                params.DataConverter,
 		failureConverter:             params.FailureConverter,
+		outerChain:                   converter.BuildOuterChain(params.DataConverter),
 		stickyUUID:                   stickyUUID,
 		StickyScheduleToStartTimeout: params.StickyScheduleToStartTimeout,
 		stickyCacheSize:              params.cache.MaxWorkflowCacheSize(),
@@ -414,6 +421,13 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 	// close doneCh so local activity worker won't get blocked forever when trying to send back result to laResultCh.
 	defer close(doneCh)
 
+	// Pre-decode payload fields in the initial history batch and wrap the
+	// iterator so that subsequent pages are also decoded outside the workflow
+	// goroutine.
+	if err := wtp.decodeWorkflowTaskPayloads(task); err != nil {
+		return err
+	}
+
 	wfctx, err := wtp.contextManager.GetOrCreateWorkflowContext(task.task, task.historyIterator)
 	if err != nil {
 		return err
@@ -459,6 +473,9 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 				task.doneCh = doneCh
 				task.laResultCh = laResultCh
 				task.laRetryCh = laRetryCh
+				if err := wtp.decodeWorkflowTaskPayloads(task); err != nil {
+					return nil, err
+				}
 				return task, nil
 			},
 		)
@@ -485,6 +502,10 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 
 		// we are getting new workflow task, so reset the workflowTask and continue process the new one
 		task = wtp.toWorkflowTask(response.WorkflowTask)
+		if err := wtp.decodeWorkflowTaskPayloads(task); err != nil {
+			taskErr = err
+			return err
+		}
 	}
 }
 
@@ -580,6 +601,22 @@ func (wtp *workflowTaskProcessor) sendTaskCompletedRequest(
 				ScheduleToStartTimeout: durationpb.New(wtp.StickyScheduleToStartTimeout),
 			}
 		}
+		// Post-encode: apply codec layers to command and query-result payloads
+		// now that they have been produced by the inner (codec-free) DataConverter
+		// inside the workflow goroutine.
+		if wtp.outerChain != nil {
+			encodeOpts := makeEncodeVisitor(wtp.outerChain)
+			for _, cmd := range request.Commands {
+				if err = proxy.VisitPayloads(ctx, cmd, encodeOpts); err != nil {
+					return nil, err
+				}
+			}
+			for _, qr := range request.QueryResults {
+				if err = proxy.VisitPayloads(ctx, qr, encodeOpts); err != nil {
+					return nil, err
+				}
+			}
+		}
 		eagerReserved := wtp.eagerActivityExecutor.applyToRequest(request)
 		response, err = wtp.service.RespondWorkflowTaskCompleted(grpcCtx, request)
 		if err != nil {
@@ -636,6 +673,90 @@ func (wtp *workflowTaskProcessor) reportGrpcMessageTooLarge(
 		panic("unknown request type from ProcessWorkflowTask()")
 	}
 	return
+}
+
+// decodingHistoryIterator wraps a HistoryIterator and decodes payload fields
+// in each fetched page using the provided outer DataConverter chain.
+type decodingHistoryIterator struct {
+	inner      HistoryIterator
+	outerChain converter.DataConverter
+}
+
+func (d *decodingHistoryIterator) GetNextPage() (*historypb.History, error) {
+	history, err := d.inner.GetNextPage()
+	if err != nil || history == nil {
+		return history, err
+	}
+	decodeOpts := makeDecodeVisitor(d.outerChain)
+	for _, event := range history.Events {
+		if err := proxy.VisitPayloads(context.Background(), event, decodeOpts); err != nil {
+			return nil, err
+		}
+	}
+	return history, nil
+}
+
+func (d *decodingHistoryIterator) HasNextPage() bool { return d.inner.HasNextPage() }
+func (d *decodingHistoryIterator) Reset()            { d.inner.Reset() }
+
+// makeDecodeVisitor returns VisitPayloadsOptions that decodes each visited
+// payload using outerChain.FromPayload (outer codec layers only, no type
+// conversion).
+func makeDecodeVisitor(outerChain converter.DataConverter) proxy.VisitPayloadsOptions {
+	return proxy.VisitPayloadsOptions{
+		SkipSearchAttributes: true,
+		Visitor: func(_ *proxy.VisitPayloadsContext, payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+			result := make([]*commonpb.Payload, len(payloads))
+			for i, p := range payloads {
+				if err := outerChain.FromPayload(p, &result[i]); err != nil {
+					return nil, err
+				}
+			}
+			return result, nil
+		},
+	}
+}
+
+// makeEncodeVisitor returns VisitPayloadsOptions that encodes each visited
+// payload using outerChain.ToPayload (outer codec layers only, no type
+// conversion).
+func makeEncodeVisitor(outerChain converter.DataConverter) proxy.VisitPayloadsOptions {
+	return proxy.VisitPayloadsOptions{
+		SkipSearchAttributes: true,
+		Visitor: func(_ *proxy.VisitPayloadsContext, payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+			result := make([]*commonpb.Payload, len(payloads))
+			for i, p := range payloads {
+				encoded, err := outerChain.ToPayload(p)
+				if err != nil {
+					return nil, err
+				}
+				result[i] = encoded
+			}
+			return result, nil
+		},
+	}
+}
+
+// decodeWorkflowTaskPayloads pre-decodes payload fields in the task's initial
+// history events and wraps its historyIterator to decode subsequent pages.
+// No-op if wtp.outerChain is nil.
+func (wtp *workflowTaskProcessor) decodeWorkflowTaskPayloads(task *workflowTask) error {
+	if wtp.outerChain == nil {
+		return nil
+	}
+	decodeOpts := makeDecodeVisitor(wtp.outerChain)
+	for _, event := range task.task.History.GetEvents() {
+		if err := proxy.VisitPayloads(context.Background(), event, decodeOpts); err != nil {
+			return err
+		}
+	}
+	if task.historyIterator != nil {
+		task.historyIterator = &decodingHistoryIterator{
+			inner:      task.historyIterator,
+			outerChain: wtp.outerChain,
+		}
+	}
+	return nil
 }
 
 func (wtp *workflowTaskProcessor) errorToFailWorkflowTask(taskToken []byte, err error) *workflowservice.RespondWorkflowTaskFailedRequest {
