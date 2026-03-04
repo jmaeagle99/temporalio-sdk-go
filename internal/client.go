@@ -4,9 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/google/uuid"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
@@ -610,6 +611,9 @@ type (
 		//
 		// NOTE: Experimental
 		WorkerHeartbeatInterval time.Duration
+
+		// NOTE: Experimental
+		ExternalStorage StorageOptions
 	}
 
 	// HeadersProvider returns a map of gRPC headers that should be used on every request.
@@ -1233,6 +1237,11 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		heartbeatInterval = options.WorkerHeartbeatInterval
 	}
 
+	storageParams, err := StorageOptionsToParams(options.ExternalStorage)
+	if err != nil {
+		panic(fmt.Sprintf("invalid ExternalStorage options: %v", err))
+	}
+
 	client := &WorkflowClient{
 		workflowService:          workflowServiceClient,
 		conn:                     conn,
@@ -1254,6 +1263,7 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		getSystemInfoTimeout:    options.ConnectionOptions.GetSystemInfoTimeout,
 		workerHeartbeatInterval: heartbeatInterval,
 		workerGroupingKey:       uuid.NewString(),
+		storageParams:           storageParams,
 	}
 
 	if heartbeatInterval > 0 {
@@ -1261,7 +1271,10 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 	}
 
 	// Create outbound interceptor by wrapping backwards through chain
-	client.interceptor = &workflowClientInterceptor{client: client}
+	client.interceptor = &workflowClientInterceptor{
+		client:                 client,
+		outboundPayloadVisitor: NewStorageStoreVisitor(storageParams),
+	}
 	for i := len(options.Interceptors) - 1; i >= 0; i-- {
 		client.interceptor = options.Interceptors[i].InterceptClient(client.interceptor)
 	}

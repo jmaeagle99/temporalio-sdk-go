@@ -88,6 +88,7 @@ type (
 		// The pointer value is shared across multiple clients. If non-nil, only
 		// access/mutate atomically.
 		unclosedClients *int32
+		storageParams   storageParameters
 	}
 
 	// namespaceClient is the client for managing namespaces.
@@ -1756,7 +1757,8 @@ func getWorkflowMemo(input map[string]interface{}, dc converter.DataConverter, u
 }
 
 type workflowClientInterceptor struct {
-	client *WorkflowClient
+	client                 *WorkflowClient
+	outboundPayloadVisitor PayloadVisitor
 }
 
 func createStartWorkflowInput(

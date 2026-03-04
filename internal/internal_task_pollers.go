@@ -17,6 +17,7 @@ import (
 	deploymentpb "go.temporal.io/api/deployment/v1"
 	enumspb "go.temporal.io/api/enums/v1"
 	historypb "go.temporal.io/api/history/v1"
+	"go.temporal.io/api/proxy"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 
@@ -144,6 +145,9 @@ type (
 
 		numNormalPollerMetric *numPollerMetric
 		numStickyPollerMetric *numPollerMetric
+
+		inboundVisitPayloadOptions  PayloadVisitor
+		outboundVisitPayloadOptions PayloadVisitor
 	}
 
 	// activityTaskPoller implements polling/processing a workflow task
@@ -344,6 +348,8 @@ func newWorkflowTaskProcessor(
 		eagerActivityExecutor:        params.eagerActivityExecutor,
 		numNormalPollerMetric:        newNumPollerMetric(params.MetricsHandler, metrics.PollerTypeWorkflowTask),
 		numStickyPollerMetric:        newNumPollerMetric(params.MetricsHandler, metrics.PollerTypeWorkflowStickyTask),
+		inboundVisitPayloadOptions:   NewStorageRetrievalVisitor(params.storageParams),
+		outboundVisitPayloadOptions:  NewStorageStoreVisitor(params.storageParams),
 	}
 }
 
@@ -414,6 +420,13 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 	// close doneCh so local activity worker won't get blocked forever when trying to send back result to laResultCh.
 	defer close(doneCh)
 
+	downloadPayloadMetrics := &workflowTaskStorageMetrics{}
+	ctx := context.WithValue(context.Background(), storageOperationCallbackContextKey, downloadPayloadMetrics)
+	proxy.VisitPayloads(ctx, task.task, proxy.VisitPayloadsOptions{
+		Visitor:              wtp.inboundVisitPayloadOptions.Visit,
+		SkipSearchAttributes: true,
+	})
+
 	wfctx, err := wtp.contextManager.GetOrCreateWorkflowContext(task.task, task.historyIterator)
 	if err != nil {
 		return err
@@ -448,7 +461,7 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 			wfctx,
 			func(taskCompletion *workflowTaskCompletion, startTime time.Time) (*workflowTask, error) {
 				wtp.logger.Debug("Force RespondWorkflowTaskCompleted.", "TaskStartedEventID", task.task.GetStartedEventId())
-				heartbeatResponse, err := wtp.RespondTaskCompletedWithMetrics(taskCompletion, nil, task.task, startTime)
+				heartbeatResponse, err := wtp.RespondTaskCompletedWithMetrics(taskCompletion, nil, task.task, startTime, downloadPayloadMetrics)
 				if err != nil {
 					return nil, err
 				}
@@ -468,7 +481,7 @@ func (wtp *workflowTaskProcessor) processWorkflowTask(task *workflowTask) (retEr
 		if _, ok := taskErr.(workflowTaskHeartbeatError); ok {
 			return taskErr
 		}
-		response, err := wtp.RespondTaskCompletedWithMetrics(taskCompletion, taskErr, task.task, startTime)
+		response, err := wtp.RespondTaskCompletedWithMetrics(taskCompletion, taskErr, task.task, startTime, downloadPayloadMetrics)
 		if err != nil {
 			// If we get an error responding to the workflow task we need to evict the execution from the cache.
 			taskErr = err
@@ -493,6 +506,7 @@ func (wtp *workflowTaskProcessor) RespondTaskCompletedWithMetrics(
 	taskErr error,
 	task *workflowservice.PollWorkflowTaskQueueResponse,
 	startTime time.Time,
+	downloadPayloadMetrics *workflowTaskStorageMetrics,
 ) (response *workflowservice.RespondWorkflowTaskCompletedResponse, err error) {
 	metricsHandler := wtp.metricsHandler.WithTags(metrics.WorkflowTags(task.WorkflowType.GetName()))
 
@@ -514,9 +528,28 @@ func (wtp *workflowTaskProcessor) RespondTaskCompletedWithMetrics(
 		taskCompletion = &workflowTaskCompletion{rawRequest: failWorkflowTask}
 	}
 
-	metricsHandler.Timer(metrics.WorkflowTaskExecutionLatency).Record(time.Since(startTime))
+	uploadPayloadMetrics := &workflowTaskStorageMetrics{}
+	ctx := context.WithValue(context.Background(), storageOperationCallbackContextKey, uploadPayloadMetrics)
+	proxy.VisitPayloads(ctx, taskCompletion.rawRequest, proxy.VisitPayloadsOptions{
+		Visitor:              wtp.outboundVisitPayloadOptions.Visit,
+		SkipSearchAttributes: true,
+	})
+
+	taskDuration := time.Since(startTime)
+	metricsHandler.Timer(metrics.WorkflowTaskExecutionLatency).Record(taskDuration)
 
 	response, err = wtp.sendTaskCompletedRequest(taskCompletion, task)
+
+	if taskDuration > 5*time.Second {
+		wtp.logger.Info(fmt.Sprintf("[TMPRL1104] The workflow task that started with event ID %d has taken more than 5s.", task.GetStartedEventId()))
+		wtp.logger.Info(fmt.Sprintf("[TMPRL1104] Total wall time: %fs", taskDuration.Seconds()))
+		if downloadPayloadMetrics.PayloadCount > 0 {
+			wtp.logger.Info(fmt.Sprintf("[TMPRL1104] Downloaded external payloads: time %fs, count %d, total size %db", downloadPayloadMetrics.TotalDuration.Seconds(), downloadPayloadMetrics.PayloadCount, downloadPayloadMetrics.TotalSize))
+		}
+		if uploadPayloadMetrics.PayloadCount > 0 {
+			wtp.logger.Info(fmt.Sprintf("[TMPRL1104] Uploaded external payloads: time %fs, count %d, total size %db", uploadPayloadMetrics.TotalDuration.Seconds(), uploadPayloadMetrics.PayloadCount, uploadPayloadMetrics.TotalSize))
+		}
+	}
 
 	var grpcMessageTooLargeErr *retry.GrpcMessageTooLargeError
 	if errors.As(err, &grpcMessageTooLargeErr) {
@@ -620,6 +653,10 @@ func (wtp *workflowTaskProcessor) reportGrpcMessageTooLarge(
 		emitFailMetric = true
 		request := wtp.errorToFailWorkflowTask(task.TaskToken, sendErr)
 		request.Cause = enumspb.WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE
+		proxy.VisitPayloads(context.Background(), request, proxy.VisitPayloadsOptions{
+			Visitor:              wtp.outboundVisitPayloadOptions.Visit,
+			SkipSearchAttributes: true,
+		})
 		_, err = wtp.sendTaskCompletedRequest(&workflowTaskCompletion{rawRequest: request}, task)
 	case *workflowservice.RespondQueryTaskCompletedRequest:
 		request := &workflowservice.RespondQueryTaskCompletedRequest{
@@ -630,6 +667,10 @@ func (wtp *workflowTaskProcessor) reportGrpcMessageTooLarge(
 			Failure:       wtp.failureConverter.ErrorToFailure(sendErr),
 			Cause:         enumspb.WORKFLOW_TASK_FAILED_CAUSE_GRPC_MESSAGE_TOO_LARGE,
 		}
+		proxy.VisitPayloads(context.Background(), request, proxy.VisitPayloadsOptions{
+			Visitor:              wtp.outboundVisitPayloadOptions.Visit,
+			SkipSearchAttributes: true,
+		})
 		_, err = wtp.sendTaskCompletedRequest(&workflowTaskCompletion{rawRequest: request}, task)
 	default:
 		// should not happen
@@ -683,6 +724,18 @@ func (wtp *workflowTaskProcessor) errorToFailWorkflowTaskWithCause(taskToken []b
 	}
 
 	return builtRequest
+}
+
+type workflowTaskStorageMetrics struct {
+	PayloadCount  int
+	TotalSize     int64
+	TotalDuration time.Duration
+}
+
+func (callback *workflowTaskStorageMetrics) OnComplete(count int, size int64, duration time.Duration) {
+	callback.PayloadCount += count
+	callback.TotalSize += size
+	callback.TotalDuration += duration
 }
 
 func newLocalActivityPoller(

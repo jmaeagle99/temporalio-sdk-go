@@ -11,6 +11,7 @@ import (
 	activitypb "go.temporal.io/api/activity/v1"
 	commonpb "go.temporal.io/api/common/v1"
 	enumspb "go.temporal.io/api/enums/v1"
+	"go.temporal.io/api/proxy"
 	taskqueuepb "go.temporal.io/api/taskqueue/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/converter"
@@ -567,6 +568,11 @@ func (w *workflowClientInterceptor) ExecuteActivity(
 	if request.Header, err = headerPropagated(ctx, w.client.contextPropagators); err != nil {
 		return nil, err
 	}
+
+	proxy.VisitPayloads(ctx, request, proxy.VisitPayloadsOptions{
+		Visitor:              w.outboundPayloadVisitor.Visit,
+		SkipSearchAttributes: true,
+	})
 
 	grpcCtx, cancel := newGRPCContext(ctx, defaultGrpcRetryParameters(ctx))
 	defer cancel()

@@ -6,9 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	workerpb "go.temporal.io/api/worker/v1"
-	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 	"io"
 	"math"
 	"os"
@@ -20,6 +17,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	workerpb "go.temporal.io/api/worker/v1"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/golang/mock/gomock"
 	"github.com/google/uuid"
@@ -218,6 +219,8 @@ type (
 		pollTimeTracker *pollTimeTracker
 
 		workerInstanceKey string
+
+		storageParams storageParameters
 	}
 
 	// HistoryJSONOptions are options for HistoryFromJSON.
@@ -2137,6 +2140,7 @@ func NewAggregatedWorker(client *WorkflowClient, taskQueue string, options Worke
 		capabilities:      &capabilities,
 		pollTimeTracker:   &pollTimeTracker{},
 		workerInstanceKey: workerInstanceKey,
+		storageParams:     client.storageParams,
 	}
 
 	if options.MaxConcurrentWorkflowTaskPollers != 0 {
