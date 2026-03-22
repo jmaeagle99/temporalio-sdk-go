@@ -117,6 +117,11 @@ func (b *builder) integrationTest() error {
 		customStringField.ValueSet("Text"),
 	)
 
+	const MEMO_SIZE_ERROR_LIMIT = 5 * 1024      // 5 KiB
+	const MEMO_SIZE_WARNING_LIMIT = 1024        // 1 KiB
+	const PAYLOAD_SIZE_ERROR_LIMIT = 10 * 1024  // 10 KiB
+	const PAYLOAD_SIZE_WARNING_LIMIT = 2 * 1024 // 2 KiB
+
 	// Start dev server if wanted
 	if *devServerFlag {
 		devServer, err := testsuite.StartDevServer(context.Background(), testsuite.DevServerOptions{
@@ -161,6 +166,10 @@ func (b *builder) integrationTest() error {
 				"--dynamic-config-value", `component.nexusoperations.useSystemCallbackURL=false`,
 				"--dynamic-config-value", `component.nexusoperations.callback.endpoint.template="http://localhost:7243/namespaces/{{.NamespaceName}}/nexus/callback"`,
 				"--dynamic-config-value", "frontend.ListWorkersEnabled=true",
+				"--dynamic-config-value", fmt.Sprintf("limit.memoSize.error=%d", MEMO_SIZE_ERROR_LIMIT),
+				"--dynamic-config-value", fmt.Sprintf("limit.blobSize.error=%d", PAYLOAD_SIZE_ERROR_LIMIT),
+				"--dynamic-config-value", fmt.Sprintf("limit.memoSize.warn=%d", MEMO_SIZE_WARNING_LIMIT),
+				"--dynamic-config-value", fmt.Sprintf("limit.blobSize.warn=%d", PAYLOAD_SIZE_WARNING_LIMIT),
 			},
 		})
 		if err != nil {

@@ -623,6 +623,11 @@ type (
 		//
 		// NOTE: Experimental
 		ExternalStorage converter.ExternalStorage
+
+		// Configuration for when payload sizes exceed limits.
+		//
+		// NOTE: Experimental
+		PayloadLimits PayloadLimitOptions
 	}
 
 	// HeadersProvider returns a map of gRPC headers that should be used on every request.
@@ -1251,6 +1256,11 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		panic(fmt.Sprintf("invalid ExternalStorage options: %v", err))
 	}
 
+	payloadLimitParams, err := PayloadLimitOptionsToLimits(options.PayloadLimits)
+	if err != nil {
+		panic(fmt.Sprintf("invalid PayloadLimits options: %v", err))
+	}
+
 	client := &WorkflowClient{
 		workflowService:          workflowServiceClient,
 		conn:                     conn,
@@ -1272,16 +1282,25 @@ func NewServiceClient(workflowServiceClient workflowservice.WorkflowServiceClien
 		getSystemInfoTimeout:    options.ConnectionOptions.GetSystemInfoTimeout,
 		workerHeartbeatInterval: heartbeatInterval,
 		workerGroupingKey:       uuid.NewString(),
-		inboundPayloadVisitor:   NewExternalRetrievalVisitor(storageParams),
-		outboundPayloadVisitor:  NewExternalStorageVisitor(storageParams),
+		storageParams:           storageParams,
+		payloadWarningLimits:    payloadLimitParams,
 	}
 
 	if heartbeatInterval > 0 {
 		client.heartbeatManager = newHeartbeatManager(client, heartbeatInterval, client.logger)
 	}
 
+	payloadLimitVisitor, _ := newPayloadLimitsVisitor(payloadLimitParams, client.logger)
+
 	// Create outbound interceptor by wrapping backwards through chain
-	client.interceptor = &workflowClientInterceptor{client: client}
+	client.interceptor = &workflowClientInterceptor{
+		client:                client,
+		inboundPayloadVisitor: NewExternalRetrievalVisitor(storageParams),
+		outboundPayloadVisitor: newCompositePayloadVisitor(
+			NewExternalStorageVisitor(storageParams),
+			payloadLimitVisitor,
+		),
+	}
 	for i := len(options.Interceptors) - 1; i >= 0; i-- {
 		client.interceptor = options.Interceptors[i].InterceptClient(client.interceptor)
 	}
