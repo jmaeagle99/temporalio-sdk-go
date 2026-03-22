@@ -1,0 +1,125 @@
+package internal
+
+import (
+	"errors"
+	"sync/atomic"
+
+	commonpb "go.temporal.io/api/common/v1"
+	"go.temporal.io/api/proxy"
+	"go.temporal.io/sdk/log"
+)
+
+// Options for when payload sizes exceed limits.
+//
+// NOTE: Experimental
+//
+// Exposed as: [go.temporal.io/sdk/client.PayloadLimitOptions]
+type PayloadLimitOptions struct {
+	// The limit (in bytes) at which a memo size warning is logged.
+	MemoSizeWarning int
+	// The limit (in bytes) at which a payload size warning is logged.
+	PayloadSizeWarning int
+}
+
+type payloadSizeError struct {
+	message string
+	size    int64
+	limit   int64
+}
+
+func (e payloadSizeError) Error() string {
+	return e.message
+}
+
+type payloadLimits struct {
+	memoSize    int64
+	payloadSize int64
+}
+
+func PayloadLimitOptionsToLimits(options PayloadLimitOptions) (payloadLimits, error) {
+	memoSizeWarning := int64(options.MemoSizeWarning)
+	if memoSizeWarning < 0 {
+		return payloadLimits{}, errors.New("")
+	}
+	if memoSizeWarning == 0 {
+		memoSizeWarning = 2 * 1024
+	}
+	payloadSizeWarning := int64(options.PayloadSizeWarning)
+	if payloadSizeWarning < 0 {
+		return payloadLimits{}, errors.New("")
+	}
+	if payloadSizeWarning == 0 {
+		payloadSizeWarning = 512 * 1024
+	}
+	return payloadLimits{
+		memoSize:    memoSizeWarning,
+		payloadSize: payloadSizeWarning,
+	}, nil
+}
+
+type payloadLimitsVisitorImpl struct {
+	errorLimits   atomic.Pointer[payloadLimits]
+	warningLimits payloadLimits
+	logger        log.Logger
+}
+
+func (v *payloadLimitsVisitorImpl) Visit(ctx *proxy.VisitPayloadsContext, payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+	var totalSize int64
+	for _, payload := range payloads {
+		if payload != nil {
+			totalSize += int64(payload.Size())
+		}
+	}
+	errorLimits := v.errorLimits.Load()
+	if errorLimits != nil && errorLimits.payloadSize > 0 && totalSize > errorLimits.payloadSize {
+		return nil, payloadSizeError{
+			message: "[TMPRL1103] Attempted to upload payloads with size that exceeded the error limit.",
+			size:    totalSize,
+			limit:   errorLimits.payloadSize,
+		}
+	}
+	if v.warningLimits.payloadSize > 0 && totalSize > v.warningLimits.payloadSize && v.logger != nil {
+		v.logger.Warn(
+			"[TMPRL1103] Attempted to upload payloads with size that exceeded the warning limit.",
+			tagPayloadSize, totalSize,
+			tagPayloadSizeLimit, v.warningLimits.payloadSize,
+		)
+	}
+	return payloads, nil
+}
+
+func (v *payloadLimitsVisitorImpl) VisitMapPayload(ctx *proxy.VisitPayloadsContext, fields map[string]*commonpb.Payload) error {
+	memo, isMemo := ctx.Parent.(*commonpb.Memo)
+	if !isMemo {
+		return nil
+	}
+	totalSize := int64(memo.Size())
+	errorLimits := v.errorLimits.Load()
+	if errorLimits != nil && errorLimits.memoSize > 0 && totalSize > errorLimits.memoSize {
+		return payloadSizeError{
+			message: "[TMPRL1103] Attempted to upload memo with size that exceeded the error limit.",
+			size:    totalSize,
+			limit:   errorLimits.memoSize,
+		}
+	}
+	if v.warningLimits.memoSize > 0 && totalSize > v.warningLimits.memoSize && v.logger != nil {
+		v.logger.Warn(
+			"[TMPRL1103] Attempted to upload memo with size that exceeded the warning limit.",
+			tagMemoSize, totalSize,
+			tagMemoSizeLimit, v.warningLimits.memoSize,
+		)
+	}
+	return nil
+}
+
+func (v *payloadLimitsVisitorImpl) setErrorLimits(errorLimits *payloadLimits) {
+	v.errorLimits.Store(errorLimits)
+}
+
+func newPayloadLimitsVisitor(warningLimits payloadLimits, logger log.Logger) (PayloadVisitor, func(*payloadLimits)) {
+	visitor := &payloadLimitsVisitorImpl{
+		warningLimits: warningLimits,
+		logger:        logger,
+	}
+	return visitor, visitor.setErrorLimits
+}

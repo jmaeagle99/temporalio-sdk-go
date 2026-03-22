@@ -60,37 +60,38 @@ const (
 type (
 	// WorkflowClient is the client for starting a workflow execution.
 	WorkflowClient struct {
-		workflowService           workflowservice.WorkflowServiceClient
-		conn                      *grpc.ClientConn
-		namespace                 string
-		registry                  *registry
-		logger                    log.Logger
-		metricsHandler            metrics.Handler
-		identity                  string
-		dataConverter             converter.DataConverter
-		failureConverter          converter.FailureConverter
-		contextPropagators        []ContextPropagator
-		workerPlugins             []WorkerPlugin
-		workerInterceptors        []WorkerInterceptor
-		clientPluginNames         []string
-		interceptor               ClientOutboundInterceptor
-		excludeInternalFromRetry  *atomic.Bool
-		capabilities              *workflowservice.GetSystemInfoResponse_Capabilities
-		capabilitiesLock          sync.RWMutex
-		namespaceCapabilities     *namespacepb.NamespaceInfo_Capabilities
-		namespaceCapabilitiesLock sync.RWMutex
-		eagerDispatcher           *eagerWorkflowDispatcher
-		getSystemInfoTimeout      time.Duration
-		workerHeartbeatInterval   time.Duration
-		workerGroupingKey         string
-		heartbeatManager          *heartbeatManager
+		workflowService          workflowservice.WorkflowServiceClient
+		conn                     *grpc.ClientConn
+		namespace                string
+		registry                 *registry
+		logger                   log.Logger
+		metricsHandler           metrics.Handler
+		identity                 string
+		dataConverter            converter.DataConverter
+		failureConverter         converter.FailureConverter
+		contextPropagators       []ContextPropagator
+		workerPlugins            []WorkerPlugin
+		workerInterceptors       []WorkerInterceptor
+		clientPluginNames        []string
+		interceptor              ClientOutboundInterceptor
+		excludeInternalFromRetry *atomic.Bool
+		capabilities             *workflowservice.GetSystemInfoResponse_Capabilities
+		capabilitiesLock         sync.RWMutex
+		namespaceCapabilities    *namespacepb.NamespaceInfo_Capabilities
+		namespaceLimits          *namespacepb.NamespaceInfo_Limits
+		namespaceDataLock        sync.RWMutex
+		eagerDispatcher          *eagerWorkflowDispatcher
+		getSystemInfoTimeout     time.Duration
+		workerHeartbeatInterval  time.Duration
+		workerGroupingKey        string
+		heartbeatManager         *heartbeatManager
 
 		// The pointer value is shared across multiple clients. If non-nil, only
 		// access/mutate atomically.
-		unclosedClients        *int32
-		inboundPayloadVisitor  PayloadVisitor
-		outboundPayloadVisitor PayloadVisitor
-		storageDriverTypes     []string
+		unclosedClients      *int32
+		storageParams        storageParameters
+		storageDriverTypes   []string
+		payloadWarningLimits payloadLimits
 	}
 
 	// namespaceClient is the client for managing namespaces.
@@ -273,7 +274,7 @@ func (wc *WorkflowClient) GetWorkflow(ctx context.Context, workflowID string, ru
 		dataConverter:         wc.dataConverter,
 		failureConverter:      wc.failureConverter,
 		registry:              wc.registry,
-		inboundPayloadVisitor: wc.inboundPayloadVisitor,
+		inboundPayloadVisitor: NewExternalRetrievalVisitor(wc.storageParams),
 	}
 }
 
@@ -1446,13 +1447,14 @@ func (wc *WorkflowClient) loadCapabilities(ctx context.Context) (*workflowservic
 }
 
 // Get namespace capabilities, lazily fetching from server if not already obtained.
-func (wc *WorkflowClient) loadNamespaceCapabilities(metricsHandler metrics.Handler) (*namespacepb.NamespaceInfo_Capabilities, error) {
+func (wc *WorkflowClient) loadNamespaceData(metricsHandler metrics.Handler) (*namespacepb.NamespaceInfo_Capabilities, *namespacepb.NamespaceInfo_Limits, error) {
 	ctx := contextWithNewHeader(context.Background())
-	wc.namespaceCapabilitiesLock.RLock()
+	wc.namespaceDataLock.RLock()
 	capabilities := wc.namespaceCapabilities
-	wc.namespaceCapabilitiesLock.RUnlock()
-	if capabilities != nil {
-		return capabilities, nil
+	limits := wc.namespaceLimits
+	wc.namespaceDataLock.RUnlock()
+	if capabilities != nil || limits != nil {
+		return capabilities, limits, nil
 	}
 
 	grpcCtx, cancel := newGRPCContext(ctx, grpcMetricsHandler(metricsHandler), defaultGrpcRetryParameters(ctx))
@@ -1460,19 +1462,24 @@ func (wc *WorkflowClient) loadNamespaceCapabilities(metricsHandler metrics.Handl
 	resp, err := wc.workflowService.DescribeNamespace(grpcCtx, &workflowservice.DescribeNamespaceRequest{Namespace: wc.namespace})
 	var unimplemented *serviceerror.Unimplemented
 	if err != nil && !errors.As(err, &unimplemented) {
-		return nil, fmt.Errorf("failed reaching server: %w", err)
+		return nil, nil, fmt.Errorf("failed reaching server: %w", err)
 	}
 	if resp != nil {
 		capabilities = resp.GetNamespaceInfo().GetCapabilities()
+		limits = resp.GetNamespaceInfo().GetLimits()
 	}
 	if capabilities == nil {
 		capabilities = &namespacepb.NamespaceInfo_Capabilities{}
 	}
+	if limits == nil {
+		limits = &namespacepb.NamespaceInfo_Limits{}
+	}
 
-	wc.namespaceCapabilitiesLock.Lock()
+	wc.namespaceDataLock.Lock()
 	wc.namespaceCapabilities = capabilities
-	wc.namespaceCapabilitiesLock.Unlock()
-	return capabilities, nil
+	wc.namespaceLimits = limits
+	wc.namespaceDataLock.Unlock()
+	return capabilities, limits, nil
 }
 
 func (wc *WorkflowClient) ensureInitialized(ctx context.Context) error {
@@ -1807,7 +1814,9 @@ func getWorkflowMemo(input map[string]interface{}, dc converter.DataConverter, u
 }
 
 type workflowClientInterceptor struct {
-	client *WorkflowClient
+	client                 *WorkflowClient
+	inboundPayloadVisitor  PayloadVisitor
+	outboundPayloadVisitor PayloadVisitor
 }
 
 func createStartWorkflowInput(
@@ -1933,7 +1942,7 @@ func (w *workflowClientInterceptor) ExecuteWorkflow(
 		eagerExecutor = w.client.eagerDispatcher.applyToRequest(startRequest)
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.outboundPayloadVisitor, startRequest); err != nil {
+	if err := visitProtoPayloads(ctx, w.outboundPayloadVisitor, startRequest); err != nil {
 		return nil, err
 	}
 
@@ -1982,7 +1991,7 @@ func (w *workflowClientInterceptor) ExecuteWorkflow(
 		dataConverter:         w.client.dataConverter,
 		failureConverter:      w.client.failureConverter,
 		registry:              w.client.registry,
-		inboundPayloadVisitor: w.client.inboundPayloadVisitor,
+		inboundPayloadVisitor: w.inboundPayloadVisitor,
 	}, nil
 }
 
@@ -2085,7 +2094,7 @@ func (w *workflowClientInterceptor) updateWithStartWorkflow(
 		},
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.outboundPayloadVisitor, &multiRequest); err != nil {
+	if err := visitProtoPayloads(ctx, w.outboundPayloadVisitor, &multiRequest); err != nil {
 		return nil, err
 	}
 
@@ -2186,7 +2195,7 @@ func (w *workflowClientInterceptor) updateWithStartWorkflow(
 			break
 		}
 	}
-	if err := visitProtoPayloads(ctx, w.client.inboundPayloadVisitor, updateResp); err != nil {
+	if err := visitProtoPayloads(ctx, w.inboundPayloadVisitor, updateResp); err != nil {
 		return nil, err
 	}
 	return updateResp, nil
@@ -2226,7 +2235,7 @@ func (w *workflowClientInterceptor) SignalWorkflow(ctx context.Context, in *Clie
 		request.RequestId = uuid.NewString()
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.outboundPayloadVisitor, request); err != nil {
+	if err := visitProtoPayloads(ctx, w.outboundPayloadVisitor, request); err != nil {
 		return err
 	}
 
@@ -2305,7 +2314,7 @@ func (w *workflowClientInterceptor) SignalWithStartWorkflow(
 		return nil, err
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.outboundPayloadVisitor, signalWithStartRequest); err != nil {
+	if err := visitProtoPayloads(ctx, w.outboundPayloadVisitor, signalWithStartRequest); err != nil {
 		return nil, err
 	}
 
@@ -2337,7 +2346,7 @@ func (w *workflowClientInterceptor) SignalWithStartWorkflow(
 		dataConverter:         w.client.dataConverter,
 		failureConverter:      w.client.failureConverter,
 		registry:              w.client.registry,
-		inboundPayloadVisitor: w.client.inboundPayloadVisitor,
+		inboundPayloadVisitor: w.inboundPayloadVisitor,
 	}, nil
 }
 
@@ -2374,7 +2383,7 @@ func (w *workflowClientInterceptor) TerminateWorkflow(ctx context.Context, in *C
 		Details:  datailsPayload,
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.outboundPayloadVisitor, request); err != nil {
+	if err := visitProtoPayloads(ctx, w.outboundPayloadVisitor, request); err != nil {
 		return err
 	}
 
@@ -2455,7 +2464,7 @@ func (w *workflowClientInterceptor) DescribeWorkflow(
 	o := &WorkflowExecutionDescription{
 		WorkflowExecutionMetadata: m,
 		dc:                        w.client.dataConverter,
-		inboundPayloadVisitor:     w.client.inboundPayloadVisitor,
+		inboundPayloadVisitor:     w.inboundPayloadVisitor,
 		staticSummaryPayload:      resp.GetExecutionConfig().GetUserMetadata().GetSummary(),
 		staticDetailsPayload:      resp.GetExecutionConfig().GetUserMetadata().GetDetails(),
 	}
@@ -2496,7 +2505,7 @@ func (w *workflowClientInterceptor) QueryWorkflow(
 		QueryRejectCondition: in.QueryRejectCondition,
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.outboundPayloadVisitor, req); err != nil {
+	if err := visitProtoPayloads(ctx, w.outboundPayloadVisitor, req); err != nil {
 		return nil, err
 	}
 
@@ -2508,7 +2517,7 @@ func (w *workflowClientInterceptor) QueryWorkflow(
 		return nil, err
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.inboundPayloadVisitor, resp); err != nil {
+	if err := visitProtoPayloads(ctx, w.inboundPayloadVisitor, resp); err != nil {
 		return nil, err
 	}
 
@@ -2530,7 +2539,7 @@ func (w *workflowClientInterceptor) UpdateWorkflow(
 		return nil, err
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.outboundPayloadVisitor, req); err != nil {
+	if err := visitProtoPayloads(ctx, w.outboundPayloadVisitor, req); err != nil {
 		return nil, err
 	}
 
@@ -2556,7 +2565,7 @@ func (w *workflowClientInterceptor) UpdateWorkflow(
 		}
 	}
 
-	if err := visitProtoPayloads(ctx, w.client.inboundPayloadVisitor, resp); err != nil {
+	if err := visitProtoPayloads(ctx, w.inboundPayloadVisitor, resp); err != nil {
 		return nil, err
 	}
 
@@ -2679,7 +2688,7 @@ func (w *workflowClientInterceptor) PollWorkflowUpdate(
 			return nil, err
 		}
 
-		if err := visitProtoPayloads(parentCtx, w.client.inboundPayloadVisitor, resp); err != nil {
+		if err := visitProtoPayloads(parentCtx, w.inboundPayloadVisitor, resp); err != nil {
 			return nil, err
 		}
 

@@ -41,4 +41,8 @@ const (
 	tagPayloadUploadCount           = "PayloadUploadCount"
 	tagPayloadUploadSize            = "PayloadUploadSize"
 	tagPayloadUploadDuration        = "PayloadUploadDuration"
+	tagPayloadSize                  = "PayloadSize"
+	tagPayloadSizeLimit             = "PayloadSizeLimit"
+	tagMemoSize                     = "MemoSize"
+	tagMemoSizeLimit                = "MemoSizeLimit"
 )
