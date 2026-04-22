@@ -1615,7 +1615,7 @@ type replayStorageMetrics struct {
 	warnedUnconfigured bool
 }
 
-func (c *replayStorageMetrics) PayloadBatchCompleted(_ int, _ int64, _ time.Duration) {}
+func (c *replayStorageMetrics) PayloadBatchCompleted(_ int, _ int64, _ time.Duration, _ []string) {}
 
 func (c *replayStorageMetrics) UnconfiguredStorageReference() {
 	c.mu.Lock()

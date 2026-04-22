@@ -78,7 +78,7 @@ func driversEqual(a, b converter.StorageDriver) (equal bool) {
 }
 
 type storageOperationCallback interface {
-	PayloadBatchCompleted(count int, size int64, duration time.Duration)
+	PayloadBatchCompleted(count int, size int64, duration time.Duration, driverNames []string)
 	UnconfiguredStorageReference()
 }
 
@@ -217,7 +217,7 @@ func (v *externalRetrievalVisitor) Visit(ctx *proxy.VisitPayloadsContext, payloa
 
 	if callbackValue := ctx.Value(storageOperationCallbackContextKey); callbackValue != nil {
 		if callback, isCallback := callbackValue.(storageOperationCallback); isCallback {
-			callback.PayloadBatchCompleted(externalCount, externalTotalSize, time.Since(startTime))
+			callback.PayloadBatchCompleted(externalCount, externalTotalSize, time.Since(startTime), driverOrder)
 		}
 	}
 	return result, nil
@@ -336,7 +336,7 @@ func (v *externalStorageVisitor) Visit(ctx *proxy.VisitPayloadsContext, payloads
 
 	if callbackValue := ctx.Value(storageOperationCallbackContextKey); callbackValue != nil {
 		if callback, isCallback := callbackValue.(storageOperationCallback); isCallback {
-			callback.PayloadBatchCompleted(externalCount, externalTotalSize, time.Since(startTime))
+			callback.PayloadBatchCompleted(externalCount, externalTotalSize, time.Since(startTime), driverOrder)
 		}
 	}
 	return result, nil
